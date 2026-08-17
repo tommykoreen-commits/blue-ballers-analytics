@@ -35,17 +35,40 @@ DB_REFRESH_SECONDS = 600  # how often the deployed app checks Drive for a freshe
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-17-draft-pick-slot-wiring"
+APP_BUILD = "2026-08-17-robust-drive-download"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
+
+
+def download_db():
+    """One attempt at pulling the latest database from Google Drive, with a single
+    retry — Drive's anonymous-link downloads are occasionally flaky/rate-limited
+    (seen in production as a bare gdown.exceptions.FileURLRetrievalError), and a
+    fresh container hitting this on every cold start is a real risk, not a
+    hypothetical one. Returns True on success, False on failure (caller decides
+    whether a stale local copy is an acceptable fallback)."""
+    import gdown
+    for attempt in range(2):
+        try:
+            gdown.download(id=st.secrets["drive_file_id"], output=DB_PATH, quiet=True, fuzzy=True)
+            return True
+        except Exception as e:
+            last_error = e
+            time.sleep(2)
+    st.session_state["db_download_error"] = str(last_error)
+    return False
 
 
 def ensure_db():
     """Downloads the latest synced database from Google Drive if the local copy is
     missing or older than DB_REFRESH_SECONDS. The Drive file itself is kept fresh by
     tommy's existing blue_ballers_sync.py/.ipynb notebook — this just means the
-    deployed app periodically catches up on its own, no manual re-upload step."""
-    stale = not os.path.exists(DB_PATH) or (time.time() - os.path.getmtime(DB_PATH)) > DB_REFRESH_SECONDS
+    deployed app periodically catches up on its own, no manual re-upload step. Falls
+    back to a stale local copy (with a visible warning) rather than hard-crashing the
+    whole app if Drive is temporarily unreachable/rate-limited — only a truly cold
+    start with no local copy AND a failed download is fatal."""
+    have_local_copy = os.path.exists(DB_PATH)
+    stale = not have_local_copy or (time.time() - os.path.getmtime(DB_PATH)) > DB_REFRESH_SECONDS
     if not stale:
         return
     if "drive_file_id" not in st.secrets:
@@ -55,8 +78,16 @@ def ensure_db():
             "of the URL) in the app's Settings > Secrets."
         )
         st.stop()
-    import gdown
-    gdown.download(id=st.secrets["drive_file_id"], output=DB_PATH, quiet=True)
+    if download_db():
+        return
+    if have_local_copy:
+        st.warning(
+            "Couldn't refresh data from Google Drive just now (it may be temporarily "
+            "rate-limited) — showing the last successfully downloaded copy instead."
+        )
+    else:
+        st.error(f"Couldn't download the database from Google Drive: {st.session_state.get('db_download_error')}")
+        st.stop()
 
 
 ensure_db()
@@ -2657,10 +2688,12 @@ st.sidebar.caption(f"Last synced: {synced_at}")
 st.sidebar.caption(f"Build: {APP_BUILD}")
 if st.sidebar.button("Refresh Data"):
     with st.spinner("Downloading latest league data..."):
-        import gdown
-        gdown.download(id=st.secrets["drive_file_id"], output=DB_PATH, quiet=True)
-    load_table.clear()
-    st.rerun()
+        refreshed = download_db()
+    if refreshed:
+        load_table.clear()
+        st.rerun()
+    else:
+        st.sidebar.error(f"Refresh failed: {st.session_state.get('db_download_error')}")
 
 standings = get_standings(league_id)
 rankings = get_power_rankings(league_id, synced_at)
