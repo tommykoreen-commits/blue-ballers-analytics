@@ -63,7 +63,7 @@ DB_PATH = "/content/drive/MyDrive/BlueBallersAnalytics/blue_ballers.db"
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether Colab is actually running the latest code (vs. a stale cell that was re-run
 # without re-pasting the current file first, which happens silently otherwise).
-APP_BUILD = "2026-08-17-trade-tree-sankey"
+APP_BUILD = "2026-08-17-lineage-max-hops"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -1799,8 +1799,10 @@ def describe_trade(txn, players_df, league_id, global_team_lookup):
 # stays constant across every re-trade (only owner_id/previous_owner_id change per
 # hop), which is what makes tracing a single pick's full lineage tractable at all.
 # ---------------------------------------------------------------------------
-LINEAGE_MAX_HOPS = 6  # safety cap per asset per direction — real chains in an 8-team
-# league are short; this only guards against a data anomaly causing a runaway walk
+LINEAGE_MAX_HOPS = 15  # safety cap per asset per direction — tommy's own motivating
+# example (a pick re-traded multiple times across several seasons before becoming a
+# real rookie) needs real headroom; this only guards against a genuine data anomaly
+# causing a runaway walk, not against legitimately long real trade chains
 
 
 @st.cache_data(ttl=1800)
