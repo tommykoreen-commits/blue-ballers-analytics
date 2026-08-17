@@ -31,11 +31,14 @@ POSITION_DECLINE_RATE = {"QB": 0.04, "RB": 0.12, "WR": 0.07, "TE": 0.08, "K": 0.
 ROUND_BASE_VALUE = {1: 100, 2: 50, 3: 25, 4: 12}
 
 DB_PATH = "blue_ballers.db"
-DB_REFRESH_SECONDS = 600  # how often the deployed app checks Drive for a fresher sync
+DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fresher sync (4h —
+# tommy's data only changes when he manually re-syncs, so there's no benefit to checking more
+# often, only more risk of tripping Google Drive's anonymous-download rate limit. Use the
+# sidebar's "Refresh Data" button for an immediate pull right after a sync instead.
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-17-robust-drive-download"
+APP_BUILD = "2026-08-17-longer-refresh-interval"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
