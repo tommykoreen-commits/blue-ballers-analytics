@@ -38,7 +38,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-17-longer-refresh-interval"
+APP_BUILD = "2026-08-17-draft-class-strength"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -1479,7 +1479,21 @@ def pick_slot_value(round_no, slot):
     return base * (decay ** (slot - 1))
 
 
-def pick_value(round_no, original_roster_power_percentile, slot_distribution=None):
+CLASS_STRENGTH_MULTIPLIER = {
+    "2026": 0.88,  # weak class — legit top tier (Love/Tate/Lemon/Tyson) but a steep
+                    # cliff after that; thin QB/TE, shaky RB depth beyond Love
+    "2027": 1.12,  # strong class — "historic" QB class (Manning/Lagway/Moore) + the
+                    # deepest WR class in recent memory (Jeremiah Smith headlines it);
+                    # KeepTradeCut is already pricing late 2027 1sts above mid 2026 1sts
+}  # research-backed via WebSearch (2026-08-17): FFToday, DraftSharks, FantasyPros,
+# Yahoo Sports, FantasyLife all converge on this same direction independently, and it
+# shows up in real KTC trade pricing, not just punditry — see project memory for the
+# full source list. Any season not listed (including 2028+, where commentary is still
+# "too early"/pure recruiting-hype speculation) defaults to a neutral 1.0x rather than
+# guessing a direction with no real consensus behind it.
+
+
+def pick_value(round_no, original_roster_power_percentile, slot_distribution=None, season=None):
     """Value of a future (undrafted) pick. When a real simulated `slot_distribution`
     is available (this league's immediate upcoming draft, from the Championship Odds
     simulator's `draft_slot_distribution`), values the pick as its expectation across
@@ -1487,13 +1501,15 @@ def pick_value(round_no, original_roster_power_percentile, slot_distribution=Non
     convex shape, and a real improvement over a single power-percentile point estimate.
     Falls back to an estimated slot from the team's current power percentile for picks
     in seasons too far out to simulate (this is a fixed 8-team league: weakest team ≈
-    slot 1, strongest ≈ slot 8)."""
+    slot 1, strongest ≈ slot 8). `season` scales the result by that draft class's
+    real-world strength consensus (CLASS_STRENGTH_MULTIPLIER) — a 2026 pick is worth
+    less than an otherwise-identical 2027 pick, not just a function of slot."""
     if slot_distribution:
-        return round(
-            sum(p * pick_slot_value(round_no, slot) for slot, p in enumerate(slot_distribution, start=1)), 1
-        )
-    estimated_slot = 1 + (1 - original_roster_power_percentile) * 7
-    return round(pick_slot_value(round_no, estimated_slot), 1)
+        base = sum(p * pick_slot_value(round_no, slot) for slot, p in enumerate(slot_distribution, start=1))
+    else:
+        estimated_slot = 1 + (1 - original_roster_power_percentile) * 7
+        base = pick_slot_value(round_no, estimated_slot)
+    return round(base * CLASS_STRENGTH_MULTIPLIER.get(str(season), 1.0), 1)
 
 
 def value_pick_row(row, power_pct, current_season_str, odds):
@@ -1504,8 +1520,9 @@ def value_pick_row(row, power_pct, current_season_str, odds):
     if row["season"] == current_season_str:
         dist = odds.get(int(row["original_roster_id"]), {}).get("draft_slot_distribution")
         if dist:
-            return pick_value(row["round"], power_pct.get(row["original_roster_id"], 0.5), slot_distribution=dist)
-    return pick_value(row["round"], power_pct.get(row["original_roster_id"], 0.5))
+            return pick_value(row["round"], power_pct.get(row["original_roster_id"], 0.5),
+                               slot_distribution=dist, season=row["season"])
+    return pick_value(row["round"], power_pct.get(row["original_roster_id"], 0.5), season=row["season"])
 
 
 def get_global_team_lookup():
@@ -1653,7 +1670,7 @@ def grade_trade(txn, value_table, power_pct, global_team_lookup, league_id):
             future_given[roster_id] += future_weighted_value(val, age)
 
     for pick in draft_picks:
-        val = pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5))
+        val = pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5), season=pick.get("season"))
         new_owner, prev_owner = pick.get("owner_id"), pick.get("previous_owner_id")
         if new_owner in received:
             received[new_owner] += val
@@ -3283,7 +3300,8 @@ def page_rookie_draft():
         "a flat linear scale. For this season's picks, value is the expectation over the Championship "
         "Odds simulator's actual projected draft-slot odds (below); picks further out fall back to an "
         "estimated slot from the original team's current strength, since there's nothing left to simulate "
-        "that far ahead."
+        "that far ahead. Also scaled by real-world draft class strength consensus — 2026 is a weak class "
+        "(0.88x), 2027 is a strong one (1.12x); other years are neutral until there's a real read on them."
     )
     league_pick_inventory = get_pick_inventory(league_id, int(season_choice), synced_at).copy()
     league_power_pct = dict(zip(rankings["roster_id"], rankings["power_score"].rank(pct=True)))
