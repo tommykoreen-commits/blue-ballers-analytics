@@ -63,7 +63,7 @@ DB_PATH = "/content/drive/MyDrive/BlueBallersAnalytics/blue_ballers.db"
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether Colab is actually running the latest code (vs. a stale cell that was re-run
 # without re-pasting the current file first, which happens silently otherwise).
-APP_BUILD = "2026-08-17-lineage-max-hops"
+APP_BUILD = "2026-08-17-pick-resolution-week18-fix"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -1857,7 +1857,13 @@ def resolve_pick_to_player(pick_season, pick_round, original_roster_id, cache_ke
         return None
     lid = season_row.iloc[0]["league_id"]
     playoff_settings = get_playoff_settings(lid)
-    if get_last_completed_week(lid) != playoff_settings["round2_weeks"][1]:
+    last_completed = get_last_completed_week(lid)
+    # >=, not == : real-NFL week 18 data can leak into matchups even though this
+    # league's fantasy season ends at round2_weeks[1] (the same leakage Hall of
+    # Fame's weekly-score records had to guard against) — requiring exact equality
+    # meant a fully-complete season NEVER matched and every pick silently failed
+    # to resolve.
+    if last_completed is None or last_completed < playoff_settings["round2_weeks"][1]:
         return None  # season not fully complete yet — no exact slot to resolve
     rookie_drafts = get_rookie_draft_list(cache_key)
     draft_row = rookie_drafts[rookie_drafts["league_id"] == lid]
