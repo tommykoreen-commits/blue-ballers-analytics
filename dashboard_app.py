@@ -38,7 +38,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-17-draft-class-strength"
+APP_BUILD = "2026-08-17-trade-tree-sankey"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -1817,20 +1817,96 @@ def describe_trade(txn, players_df, league_id, global_team_lookup):
     return [template.format(a=team_a, b=team_b, gains_a=humanize_list(gains[a]), gains_b=humanize_list(gains[b]))]
 
 
-def get_all_ever_rostered_ids():
-    league_ids = load_table("SELECT league_id FROM league_seasons")["league_id"].tolist()
-    ids = set()
-    for lid in league_ids:
-        ids |= get_all_rostered_player_ids(lid)
-    return ids
+# ---------------------------------------------------------------------------
+# Trade Tree — starting from one trade, traces every asset involved (players AND
+# picks) both backward (where it came from) and forward (everywhere it went,
+# including what a traded pick actually turned into once drafted) into a Sankey
+# diagram. A pick's `roster_id` field in a trade's JSON is the ORIGINAL owner and
+# stays constant across every re-trade (only owner_id/previous_owner_id change per
+# hop), which is what makes tracing a single pick's full lineage tractable at all.
+# ---------------------------------------------------------------------------
+LINEAGE_MAX_HOPS = 6  # safety cap per asset per direction — real chains in an 8-team
+# league are short; this only guards against a data anomaly causing a runaway walk
 
 
-def build_player_ownership_history(player_id):
+@st.cache_data(ttl=1800)
+def get_all_pick_trade_events(cache_key):
+    """Every (season, round, original-owner) pick move across every trade ever
+    synced, one row per pick per trade. Lets a single pick's full lineage be found
+    regardless of how many times it's been re-traded."""
+    all_seasons = load_table("SELECT league_id, season FROM league_seasons")
+    rows = []
+    for _, srow in all_seasons.iterrows():
+        lid = srow["league_id"]
+        txns = load_table(
+            "SELECT transaction_id, draft_picks, created FROM transactions WHERE league_id = ? AND type = 'trade'",
+            params=(lid,),
+        )
+        for _, txn in txns.iterrows():
+            for p in parse_json_field(txn["draft_picks"], []):
+                rows.append({
+                    "transaction_id": txn["transaction_id"], "league_id": lid, "created": txn["created"],
+                    "pick_season": p.get("season"), "pick_round": p.get("round"),
+                    "original_roster_id": p.get("roster_id"),
+                    "owner_id": p.get("owner_id"), "previous_owner_id": p.get("previous_owner_id"),
+                })
+    return pd.DataFrame(rows)
+
+
+def get_exact_draft_slot_map(league_id):
+    """Exact real draft slot (1-8) per roster for one season's league_id, reusing
+    the verified draft-order simulator in n_trials=1 'exact replay' mode (same
+    technique GM Profiles uses for exact historical placements) — once a season is
+    fully complete every week is real data, so this isn't simulating anything,
+    just replaying what actually happened."""
+    local_standings = get_standings(league_id)
+    distributions = estimate_team_distributions(league_id, local_standings)
+    result = run_simulation(league_id, local_standings, distributions, n_trials=1)
+    return {rid: int(round(info["expected_draft_slot"])) for rid, info in result.items()}
+
+
+@st.cache_data(ttl=1800)
+def get_exact_draft_slot_map_cached(league_id, cache_key):
+    return get_exact_draft_slot_map(league_id)
+
+
+def resolve_pick_to_player(pick_season, pick_round, original_roster_id, cache_key):
+    """The real player a specific (season, round, original-owner) pick turned into
+    — None if that season's rookie draft hasn't happened/been synced yet (a still-
+    future pick). Slot is derived from the ORIGINAL owner's real finish that season,
+    since that's what determines the numbered pick regardless of who ultimately
+    used it to draft."""
+    season_row = load_table("SELECT league_id FROM league_seasons WHERE season = ?", params=(pick_season,))
+    if season_row.empty:
+        return None
+    lid = season_row.iloc[0]["league_id"]
+    playoff_settings = get_playoff_settings(lid)
+    if get_last_completed_week(lid) != playoff_settings["round2_weeks"][1]:
+        return None  # season not fully complete yet — no exact slot to resolve
+    rookie_drafts = get_rookie_draft_list(cache_key)
+    draft_row = rookie_drafts[rookie_drafts["league_id"] == lid]
+    if draft_row.empty:
+        return None
+    draft_id = draft_row.iloc[0]["draft_id"]
+    slot_map = get_exact_draft_slot_map_cached(lid, cache_key)
+    slot = slot_map.get(int(original_roster_id))
+    if slot is None:
+        return None
+    pick_no = (int(pick_round) - 1) * 8 + slot
+    result = load_table("SELECT player_id FROM draft_picks WHERE draft_id = ? AND pick_no = ?",
+                         params=(draft_id, pick_no))
+    return result.iloc[0]["player_id"] if not result.empty else None
+
+
+def get_player_event_history(player_id):
+    """Every event this player was involved in — draft plus every transaction where
+    they were added — WITH transaction_id/draft_id, needed to label/link Sankey
+    nodes back to the actual trade (build_player_ownership_history only needs
+    enough detail for a plain-text list, not identifiers)."""
     events = []
-
     draft_rows = load_table(
         """
-        SELECT d.season, dp.roster_id, d.league_id
+        SELECT d.season, dp.roster_id, d.league_id, d.draft_id
         FROM draft_picks dp JOIN drafts d ON d.draft_id = dp.draft_id
         WHERE dp.player_id = ?
         ORDER BY d.season ASC
@@ -1838,14 +1914,15 @@ def build_player_ownership_history(player_id):
         params=(player_id,),
     )
     for _, row in draft_rows.iterrows():
-        events.append({"season": row["season"], "league_id": row["league_id"],
-                        "week": None, "type": "draft", "roster_id": row["roster_id"], "order": (row["season"], 0)})
+        events.append({"season": row["season"], "league_id": row["league_id"], "week": None,
+                        "type": "draft", "roster_id": row["roster_id"], "transaction_id": None,
+                        "draft_id": row["draft_id"], "order": (row["season"], 0)})
 
     all_seasons = load_table("SELECT league_id, season FROM league_seasons ORDER BY season ASC")
     for _, row in all_seasons.iterrows():
         lid = row["league_id"]
         txns = load_table(
-            "SELECT week, type, adds, created FROM transactions WHERE league_id = ? ORDER BY created ASC",
+            "SELECT transaction_id, week, type, adds, created FROM transactions WHERE league_id = ? ORDER BY created ASC",
             params=(lid,),
         )
         for _, txn in txns.iterrows():
@@ -1853,15 +1930,211 @@ def build_player_ownership_history(player_id):
             if player_id in adds:
                 events.append({"season": row["season"], "league_id": lid, "week": txn["week"],
                                 "type": txn["type"], "roster_id": adds[player_id],
+                                "transaction_id": txn["transaction_id"], "draft_id": None,
                                 "order": (row["season"], txn["created"])})
-
     events.sort(key=lambda e: e["order"])
     return events
 
 
 @st.cache_data(ttl=1800)
-def get_player_ownership_history(player_id, cache_key):
-    return build_player_ownership_history(player_id)
+def get_player_event_history_cached(player_id, cache_key):
+    return get_player_event_history(player_id)
+
+
+def event_label(event, global_team_lookup, players_df):
+    """Short human label for a Sankey node representing one event."""
+    team = escape_markdown(global_team_lookup.get((event["league_id"], event["roster_id"]),
+                                                     f"Roster {event['roster_id']}"))
+    if event["type"] == "draft":
+        pid = event.get("player_id")
+        name = players_df.loc[pid, "full_name"] if pid is not None and pid in players_df.index else pid
+        who = f" {escape_markdown(name)}" if name else ""
+        return f"{event['season']} Draft{who} → {team}"
+    if event["week"]:
+        return f"{event['season']} Wk{event['week']} {event['type'].replace('_', ' ').title()} → {team}"
+    return f"{event['season']} {event['type'].replace('_', ' ').title()} → {team}"
+
+
+def trace_player_chain(player_id, seed_transaction_id, seed_draft_id, direction, players_df, cache_key):
+    """Walks one player's event history one direction (1 = forward, -1 = backward)
+    from the seed event. hops[0] is always the closest event to the seed, hops[-1]
+    the furthest — same convention in both directions, so callers don't need to
+    reverse anything."""
+    events = get_player_event_history_cached(player_id, cache_key)
+    idx = None
+    for i, e in enumerate(events):
+        if seed_transaction_id is not None and e.get("transaction_id") == seed_transaction_id:
+            idx = i
+            break
+        if seed_draft_id is not None and e.get("draft_id") == seed_draft_id:
+            idx = i
+            break
+    if idx is None:
+        return []
+    player_label = escape_markdown(players_df.loc[player_id, "full_name"] if player_id in players_df.index else player_id)
+    hops = []
+    i = idx
+    for _ in range(LINEAGE_MAX_HOPS):
+        i += direction
+        if i < 0 or i >= len(events):
+            break
+        hop_event = dict(events[i])
+        hop_event["player_id"] = player_id  # disambiguates a shared draft_id — two different
+        # players drafted in the same draft event must not collapse into one Sankey node
+        hops.append({"event": hop_event, "asset_label": player_label})
+    return hops
+
+
+def trace_pick_forward(pick_season, pick_round, original_roster_id, seed_created, pick_events_df, players_df, cache_key):
+    """Forward lineage of one pick: every re-trade after the seed, then — once no
+    further re-trade is found — whether it's actually been drafted yet, switching
+    to tracing the resulting player forward from their draft point if so."""
+    hops = []
+    matches = pick_events_df[
+        (pick_events_df["pick_season"] == pick_season)
+        & (pick_events_df["pick_round"] == pick_round)
+        & (pick_events_df["original_roster_id"] == original_roster_id)
+    ]
+    pick_label = f"a {pick_season} {ordinal(pick_round)}"
+    cursor = seed_created
+    for _ in range(LINEAGE_MAX_HOPS):
+        later = matches[matches["created"] > cursor].sort_values("created")
+        if later.empty:
+            break
+        hop_row = later.iloc[0]
+        fake_event = {"season": pick_season, "league_id": hop_row["league_id"], "week": None, "type": "trade",
+                      "roster_id": hop_row["owner_id"], "transaction_id": hop_row["transaction_id"], "draft_id": None}
+        hops.append({"event": fake_event, "asset_label": pick_label})
+        cursor = hop_row["created"]
+
+    drafted_player = resolve_pick_to_player(pick_season, pick_round, original_roster_id, cache_key)
+    if drafted_player:
+        player_events = get_player_event_history_cached(drafted_player, cache_key)
+        draft_event = next((e for e in player_events if e["type"] == "draft"), None)
+        if draft_event:
+            name = escape_markdown(players_df.loc[drafted_player, "full_name"]
+                                    if drafted_player in players_df.index else drafted_player)
+            draft_event = dict(draft_event)
+            draft_event["player_id"] = drafted_player  # disambiguates a shared draft_id
+            hops.append({"event": draft_event, "asset_label": f"{pick_label} → drafted {name}"})
+            hops.extend(trace_player_chain(drafted_player, None, draft_event["draft_id"], 1, players_df, cache_key))
+    return hops
+
+
+def trace_pick_backward(pick_season, pick_round, original_roster_id, seed_created, pick_events_df):
+    """Backward lineage of one pick: every earlier trade that moved this exact
+    pick before the seed. Stops once none is found — that's the original team's
+    own natural draft slot, nothing to trace further back."""
+    hops = []
+    matches = pick_events_df[
+        (pick_events_df["pick_season"] == pick_season)
+        & (pick_events_df["pick_round"] == pick_round)
+        & (pick_events_df["original_roster_id"] == original_roster_id)
+    ]
+    pick_label = f"a {pick_season} {ordinal(pick_round)}"
+    cursor = seed_created
+    for _ in range(LINEAGE_MAX_HOPS):
+        earlier = matches[matches["created"] < cursor].sort_values("created", ascending=False)
+        if earlier.empty:
+            break
+        hop_row = earlier.iloc[0]
+        fake_event = {"season": pick_season, "league_id": hop_row["league_id"], "week": None, "type": "trade",
+                      "roster_id": hop_row["previous_owner_id"], "transaction_id": hop_row["transaction_id"],
+                      "draft_id": None}
+        hops.append({"event": fake_event, "asset_label": pick_label})
+        cursor = hop_row["created"]
+    return hops
+
+
+def build_trade_lineage(seed_txn, players_df, cache_key):
+    """Full forward+backward lineage for every asset in one trade — one chain per
+    asset, each independently traced (a pick's chain switches to a player's chain
+    once it's actually drafted)."""
+    pick_events_df = get_all_pick_trade_events(cache_key)
+    seed_created = seed_txn["created"]
+    seed_transaction_id = seed_txn["transaction_id"]
+
+    adds = parse_json_field(seed_txn["adds"], {})
+    picks = parse_json_field(seed_txn["draft_picks"], [])
+
+    chains = []
+    for player_id in adds:
+        chains.append({
+            "backward": trace_player_chain(player_id, seed_transaction_id, None, -1, players_df, cache_key),
+            "forward": trace_player_chain(player_id, seed_transaction_id, None, 1, players_df, cache_key),
+        })
+    for p in picks:
+        pick_season, pick_round, original_roster_id = p.get("season"), p.get("round"), p.get("roster_id")
+        chains.append({
+            "backward": trace_pick_backward(pick_season, pick_round, original_roster_id, seed_created, pick_events_df),
+            "forward": trace_pick_forward(pick_season, pick_round, original_roster_id, seed_created,
+                                           pick_events_df, players_df, cache_key),
+        })
+    return chains
+
+
+def render_trade_lineage_sankey(seed_txn, chains, players_df, global_team_lookup):
+    """Renders a Trade Tree lineage as a Sankey diagram: backward chains flow into
+    the seed trade from the left, forward chains flow out to the right. Returns
+    None if there's nothing to show (no chain had any hops)."""
+    node_index = {}
+    node_labels = []
+
+    def node_key(event):
+        if event.get("transaction_id") is not None:
+            return ("txn", event["transaction_id"])
+        if event.get("draft_id") is not None:
+            # include player_id — a draft_id alone identifies the whole draft, not
+            # the specific pick, so two different players taken in the same draft
+            # must not collapse into one Sankey node
+            return ("draft", event["draft_id"], event.get("player_id"))
+        return ("unknown", id(event))
+
+    def get_node_idx(key, label):
+        if key not in node_index:
+            node_index[key] = len(node_labels)
+            node_labels.append(label)
+        return node_index[key]
+
+    seed_summary = " / ".join(describe_trade(seed_txn, players_df, seed_txn["league_id"], global_team_lookup))
+    seed_idx = get_node_idx("SEED", f"This trade — {seed_summary}"[:90])
+
+    sources, targets, values, link_labels = [], [], [], []
+    for chain in chains:
+        prev_idx = seed_idx
+        for hop in chain["backward"]:
+            idx = get_node_idx(node_key(hop["event"]), event_label(hop["event"], global_team_lookup, players_df))
+            sources.append(idx)
+            targets.append(prev_idx)
+            values.append(1)
+            link_labels.append(hop["asset_label"])
+            prev_idx = idx
+
+        prev_idx = seed_idx
+        for hop in chain["forward"]:
+            idx = get_node_idx(node_key(hop["event"]), event_label(hop["event"], global_team_lookup, players_df))
+            sources.append(prev_idx)
+            targets.append(idx)
+            values.append(1)
+            link_labels.append(hop["asset_label"])
+            prev_idx = idx
+
+    if not sources:
+        return None
+    fig = go.Figure(go.Sankey(
+        node=dict(label=node_labels, pad=20, thickness=15),
+        link=dict(source=sources, target=targets, value=values, label=link_labels),
+    ))
+    fig.update_layout(font_size=11, height=520, margin=dict(l=10, r=10, t=10, b=10))
+    return fig
+
+
+def get_all_ever_rostered_ids():
+    league_ids = load_table("SELECT league_id FROM league_seasons")["league_id"].tolist()
+    ids = set()
+    for lid in league_ids:
+        ids |= get_all_rostered_player_ids(lid)
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -3150,24 +3423,27 @@ def page_trade_center():
     )
     
     st.subheader("Trade Tree")
-    st.caption("Ownership history for any player who's been rostered in this league — draft, trades, and waiver moves.")
-    ever_rostered = get_all_ever_rostered_ids()
-    player_options = players_df.loc[players_df.index.intersection(ever_rostered)].dropna(subset=["full_name"]).copy()
-    player_options["label"] = player_options["full_name"] + " (" + player_options["position"].fillna("") + ")"
-    player_options = player_options.sort_values("full_name")
-
-    selected_label = st.selectbox("Player", player_options["label"].tolist())
-    selected_player_id = player_options.index[player_options["label"] == selected_label][0]
-
-    history = get_player_ownership_history(selected_player_id, synced_at)
-    if not history:
-        st.info("No ownership history found for this player.")
+    st.caption(
+        "Pick any trade and see the full lineage of every asset involved — where each piece came "
+        "from before this trade, and everywhere it went after, including what a traded pick "
+        "actually turned into once it was drafted."
+    )
+    tree_trades = get_all_trades(synced_at)
+    if tree_trades.empty:
+        st.info("No trades recorded yet.")
     else:
-        for event in history:
-            team = global_team_lookup.get((event["league_id"], event["roster_id"]), f"Roster {event['roster_id']}")
-            label = "Drafted by" if event["type"] == "draft" else event["type"].replace("_", " ").title() + " to"
-            week_str = f", Week {event['week']}" if event["week"] else ""
-            st.write(f"{event['season']}{week_str} — {label} **{escape_markdown(team)}**")
+        tree_labels = []
+        for _, t in tree_trades.iterrows():
+            summary = " / ".join(describe_trade(t, players_df, t["league_id"], global_team_lookup))
+            tree_labels.append(f"{t['season']} Wk{t['week']}: {summary}"[:120])
+        selected_tree_label = st.selectbox("Trade", tree_labels, key="trade_tree_pick")
+        seed_txn = tree_trades.iloc[tree_labels.index(selected_tree_label)]
+        chains = build_trade_lineage(seed_txn, players_df, synced_at)
+        fig = render_trade_lineage_sankey(seed_txn, chains, players_df, global_team_lookup)
+        if fig is None:
+            st.info("No history before or after this trade for any of its assets yet.")
+        else:
+            st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
