@@ -150,6 +150,9 @@ class Draft(Base):
     status = Column(String)
     settings = Column(JSON)
     draft_order = Column(JSON)
+    start_time = Column(BigInteger)   # scheduled start (epoch ms) -- fallback anchor
+    last_picked = Column(BigInteger)  # when the final pick was actually made (epoch ms) --
+    # the real "draft day" anchor for grading picks against value at that moment, not a guess
 
 
 class DraftPick(Base):
@@ -416,6 +419,8 @@ def sync_drafts(session, league_id):
             status=d.get("status"),
             settings=d.get("settings"),
             draft_order=d.get("draft_order"),
+            start_time=d.get("start_time"),
+            last_picked=d.get("last_picked"),
         ))
         for p in get_draft_picks(d["draft_id"]):
             if p.get("pick_no") is None:

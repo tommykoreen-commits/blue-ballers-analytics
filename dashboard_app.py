@@ -42,7 +42,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-19-stock-market-real-market-data"
+APP_BUILD = "2026-08-19-draft-day-grades-who-knows-ball"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -2469,6 +2469,116 @@ def summarize_team_grades(draft_board):
     return team_deltas.sort_values("delta", ascending=False)
 
 
+def draft_as_of_date(draft_row):
+    """Real-world date closest to when a draft actually finished. `last_picked`
+    (when the final pick was made) is the truest 'draft day' anchor; falls back
+    to `start_time` (when it was scheduled to start, in case the draft finished
+    async over several days), then to the season's own end-of-year anchor for
+    a draft synced before these columns existed (start_time/last_picked both
+    null) — same fallback pattern as trade_as_of_date."""
+    for field in ("last_picked", "start_time"):
+        ts = draft_row.get(field)
+        if ts:
+            return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date().isoformat()
+    return season_end_as_of_date(draft_row["season"])
+
+
+def get_draft_row(draft_id):
+    return load_table(
+        "SELECT draft_id, season, start_time, last_picked FROM drafts WHERE draft_id = ?",
+        params=(draft_id,),
+    ).iloc[0]
+
+
+def build_draft_day_grades(draft_id, league_id, cache_key):
+    """Was this pick good AT THE TIME it was made? Compares the drafted
+    player's real market value shortly after the draft against what the
+    market itself said that exact slot was worth at that same moment — both
+    real external-consensus numbers, unlike the existing Draft Grades
+    section above (which stays on its abstract pick-position curve
+    deliberately, since it also feeds Hall of Fame's Best/Worst Draft Pick
+    and GM Profiles' Drafting score, and changing its meaning there wasn't
+    part of this ask). `our_slot` comes from get_exact_draft_slot_map_cached
+    (the same verified real-draft-order lookup the Trade Tree lineage
+    feature uses) since this league's rookie draft is straight-order —
+    one roster keeps the same slot in every round."""
+    draft_row = get_draft_row(draft_id)
+    as_of = draft_as_of_date(draft_row)
+    picks = get_draft_picks_detail(draft_id)
+    slot_map = get_exact_draft_slot_map_cached(league_id, cache_key)
+    player_values = compute_consensus_player_values(cache_key, as_of_date=as_of)
+    players_df = get_players_df()
+    global_team_lookup = get_global_team_lookup()
+
+    rows = []
+    for _, p in picks.iterrows():
+        pid, roster_id = p["player_id"], int(p["roster_id"])
+        our_slot = slot_map.get(roster_id)
+        slot_value = (compute_consensus_pick_value(draft_row["season"], int(p["round"]), our_slot,
+                                                     cache_key, as_of_date=as_of)
+                      if our_slot else None)
+        player_value = player_values.get(pid, 0.0)
+        info = players_df.loc[pid] if pid in players_df.index else None
+        rows.append({
+            "pick_no": int(p["pick_no"]), "round": int(p["round"]), "roster_id": roster_id,
+            "team": global_team_lookup.get((league_id, roster_id), f"Roster {roster_id}"),
+            "player": info["full_name"] if info is not None else pid,
+            "position": info["position"] if info is not None else "",
+            "slot_value": round(slot_value, 1) if slot_value is not None else None,
+            "player_value": round(player_value, 1),
+            "delta": round(player_value - slot_value, 1) if slot_value is not None else None,
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=1800)
+def get_draft_day_grades(draft_id, league_id, cache_key):
+    return build_draft_day_grades(draft_id, league_id, cache_key)
+
+
+def build_who_knows_ball(cache_key):
+    """Every rookie ever drafted in this league, ranked by how much their real
+    market value has moved from draft day to today — a pure hindsight
+    leaderboard. Continuously current since it's just reading live archive
+    data on every call (no separate monthly refresh job needed, despite the
+    original 'live, monthly-refreshed' framing — the archive itself updates
+    every sync, so this is at least that fresh automatically)."""
+    rookie_drafts = get_rookie_draft_list(cache_key)
+    if rookie_drafts.empty:
+        return pd.DataFrame(columns=["season", "pick_no", "team", "player", "position",
+                                      "draft_day_value", "now_value", "swing"])
+
+    live_values = compute_consensus_player_values(cache_key)
+    players_df = get_players_df()
+    global_team_lookup = get_global_team_lookup()
+
+    rows = []
+    for _, d in rookie_drafts.iterrows():
+        draft_row = get_draft_row(d["draft_id"])
+        as_of = draft_as_of_date(draft_row)
+        draft_day_values = compute_consensus_player_values(cache_key, as_of_date=as_of)
+        picks = get_draft_picks_detail(d["draft_id"])
+        for _, p in picks.iterrows():
+            pid, roster_id = p["player_id"], int(p["roster_id"])
+            info = players_df.loc[pid] if pid in players_df.index else None
+            draft_day_val = draft_day_values.get(pid, 0.0)
+            now_val = live_values.get(pid, 0.0)
+            rows.append({
+                "season": d["season"], "pick_no": int(p["pick_no"]),
+                "team": global_team_lookup.get((d["league_id"], roster_id), f"Roster {roster_id}"),
+                "player": info["full_name"] if info is not None else pid,
+                "position": info["position"] if info is not None else "",
+                "draft_day_value": round(draft_day_val, 1), "now_value": round(now_val, 1),
+                "swing": round(now_val - draft_day_val, 1),
+            })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=1800)
+def get_who_knows_ball(cache_key):
+    return build_who_knows_ball(cache_key)
+
+
 # ---------------------------------------------------------------------------
 # GM Profiles — seven ratings per manager, each a 0-100 percentile score
 # among the league's managers, built entirely from data/logic already
@@ -3788,11 +3898,11 @@ def page_rookie_draft():
     else:
         st.subheader("Draft Grades")
         st.caption(
-            "Career Value uses the same position/age/performance heuristic as Team Pages, but scored "
-            "off each player's real career PPG across every synced season — so a player later dropped "
-            "still gets credit for the production they actually delivered, instead of scoring 0 just "
-            "because nobody currently rosters them. Expected Value is a smooth pick-position curve, "
-            "not a real consensus rookie ranking."
+            "Career Value is each player's real external market consensus value (DynastyProcess + "
+            "FantasyCalc) as of the end of the latest synced season — so a player later dropped still "
+            "gets credit for real market value, instead of scoring 0 just because nobody currently "
+            "rosters them. Expected Value is a smooth pick-position curve, not a real consensus rookie "
+            "ranking — see Draft Day Grades below for a version using real market data on both sides."
         )
         draft_season_choice = st.selectbox("Rookie draft season", rookie_drafts["season"].tolist())
         draft_row = rookie_drafts.loc[rookie_drafts["season"] == draft_season_choice].iloc[0]
@@ -3848,7 +3958,74 @@ def page_rookie_draft():
                                   "delta": "Delta"}),
                 use_container_width=True, hide_index=True,
             )
-    
+
+            st.subheader("Draft Day Grades")
+            st.caption(
+                "Was this pick good AT THE TIME it was made? Both sides here are real external market "
+                "consensus (DynastyProcess + FantasyCalc) as of shortly after this draft actually "
+                "happened — the player's value then, vs. what the market said that exact slot was worth "
+                "then — instead of Draft Grades' abstract pick-position curve above."
+            )
+            day_grades = get_draft_day_grades(draft_row["draft_id"], draft_row["league_id"], synced_at)
+            day_grades_valid = day_grades.dropna(subset=["delta"])
+            if day_grades_valid.empty:
+                st.info("No real market data reaches back to this draft yet.")
+            else:
+                day_team_grades = summarize_team_grades(day_grades_valid)
+                st.dataframe(
+                    style_grades(
+                        day_team_grades.rename(columns={"team": "Team", "delta": "Total Value Over Slot", "grade": "Grade"}),
+                        ["Grade"],
+                    ),
+                    use_container_width=True, hide_index=True,
+                )
+                best_day_pick = day_grades_valid.loc[day_grades_valid["delta"].idxmax()]
+                worst_day_pick = day_grades_valid.loc[day_grades_valid["delta"].idxmin()]
+                col_best_day, col_worst_day = st.columns(2)
+                metric_block(col_best_day, "Best Pick", f"{best_day_pick['player']} ({best_day_pick['team']})",
+                              f"+{best_day_pick['delta']:.0f} vs. slot value that day")
+                metric_block(col_worst_day, "Worst Pick", f"{worst_day_pick['player']} ({worst_day_pick['team']})",
+                              f"{worst_day_pick['delta']:.0f} vs. slot value that day")
+                st.write("**Full Draft Board**")
+                st.dataframe(
+                    day_grades_valid[["pick_no", "round", "team", "player", "position", "slot_value",
+                                       "player_value", "delta"]]
+                    .rename(columns={"pick_no": "Pick", "round": "Round", "team": "Team", "player": "Player",
+                                      "position": "Pos", "slot_value": "Slot Value", "player_value": "Player Value",
+                                      "delta": "Delta"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+    st.subheader("Who Knows Ball")
+    st.caption(
+        "Every rookie ever drafted in this league, ranked by how much their real market value has moved "
+        "since draft day — pure hindsight, and always current since it reads live market data rather "
+        "than being refreshed on a schedule."
+    )
+    wkb = get_who_knows_ball(synced_at)
+    if wkb.empty:
+        st.info("No rookie drafts found yet.")
+    else:
+        col_wkb_up, col_wkb_down = st.columns(2)
+        with col_wkb_up:
+            st.write("**Biggest Risers Since Draft Day**")
+            st.dataframe(
+                wkb.sort_values("swing", ascending=False).head(10)
+                [["season", "player", "position", "draft_day_value", "now_value", "swing"]]
+                .rename(columns={"season": "Season", "player": "Player", "position": "Pos",
+                                  "draft_day_value": "Draft Day", "now_value": "Now", "swing": "Swing"}),
+                use_container_width=True, hide_index=True,
+            )
+        with col_wkb_down:
+            st.write("**Biggest Fallers Since Draft Day**")
+            st.dataframe(
+                wkb.sort_values("swing", ascending=True).head(10)
+                [["season", "player", "position", "draft_day_value", "now_value", "swing"]]
+                .rename(columns={"season": "Season", "player": "Player", "position": "Pos",
+                                  "draft_day_value": "Draft Day", "now_value": "Now", "swing": "Swing"}),
+                use_container_width=True, hide_index=True,
+            )
+
     st.subheader("Draft Pick Value")
     st.caption(
         "Every future pick across the league. Value comes from real market consensus (DynastyProcess + "
