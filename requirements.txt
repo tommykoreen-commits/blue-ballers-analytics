@@ -1,5 +1,6 @@
-streamlit
-pandas
-numpy
-plotly
-gdown
+streamlit==1.61.1
+pandas==3.0.5
+numpy==2.5.2
+plotly==6.9.0
+gdown==6.1.0
+matplotlib==3.11.1

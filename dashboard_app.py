@@ -43,7 +43,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-19-styler-applymap-removed-fix"
+APP_BUILD = "2026-08-19-matplotlib-dep-and-version-pins"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
