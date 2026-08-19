@@ -22,9 +22,14 @@ N_TRIALS = 10000
 SHRINKAGE_GAMES = 4  # weight given to a team's own results vs. its prior-season baseline
 RECENCY_DECAY = 0.9  # per-week decay on how much a past week counts toward "current form"
 
-# Player value heuristic — no external dynasty-value source, so this is a rough in-house
-# estimate: position scarcity baseline x age-curve x on-field performance. Good for comparing
-# teams *relative to each other in this league*, not a market-calibrated trade value.
+# Live/current player and pick values now come from real external market consensus
+# (DynastyProcess + FantasyCalc — see compute_consensus_player_values/compute_consensus_pick_value
+# below), not this in-house heuristic. What's left of the heuristic is still load-bearing in 3
+# places external sources structurally can't cover: build_stock_market_history's historical
+# per-week curve (deferred — a good future upgrade target using the same DynastyProcess archive),
+# project_team_value_curve's FUTURE age-projection shape (anchored to the real consensus value at
+# year 0, but no external source prices a future season), and pick_value's fallback for picks far
+# enough out that even FantasyCalc's coarse round-level number doesn't reach yet.
 POSITION_BASELINE = {"QB": 1.4, "RB": 1.0, "WR": 1.0, "TE": 0.75, "K": 0.2}  # QB boosted: this is a 2QB/superflex league
 POSITION_PEAK_AGE = {"QB": 29, "RB": 25, "WR": 27, "TE": 27, "K": 30}
 POSITION_DECLINE_RATE = {"QB": 0.04, "RB": 0.12, "WR": 0.07, "TE": 0.08, "K": 0.05}  # value lost per year past peak
@@ -38,7 +43,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-17-pick-resolution-week18-fix"
+APP_BUILD = "2026-08-18-external-value-consensus"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -206,6 +211,249 @@ def get_players_df():
     return load_table(
         "SELECT player_id, full_name, position, team, birth_date FROM players"
     ).set_index("player_id")
+
+
+# ---------------------------------------------------------------------------
+# External dynasty valuation — blends DynastyProcess (value_2qb + ecr_2qb as
+# an ADP proxy) and FantasyCalc into one market-consensus value, replacing
+# the old in-house age-curve heuristic. blue_ballers_sync.py is the sole
+# writer of these two tables (into the same Drive-hosted DB everything else
+# reads from) — this app only ever reads them, going forward AND historically
+# (the sync script also runs a one-time backfill from DynastyProcess's git
+# history), exactly like every other table here.
+#
+# Reconciliation: each source's raw value is percentile-ranked against that
+# SAME source's own combined players+picks pool (mirroring how DynastyProcess
+# and FantasyCalc already place players and picks on one unified scale
+# internally — confirmed empirically), then the percentiles are combined via
+# median. This gives a 0-100 "value" on a scale directly comparable between
+# players and picks, which the rest of the app depends on for trade grading.
+# ---------------------------------------------------------------------------
+EXTERNAL_PICK_SLOTS_PER_ROUND = 12  # DynastyProcess/FantasyCalc both label picks on the
+# industry-standard 12-team draft-slot scale (1.01-1.12) regardless of query params —
+# confirmed empirically (FantasyCalc still returned slots up to 1.12 with numTeams=8
+# passed). This league's real 8-team slot needs mapping onto that scale before any
+# lookup — see _map_to_external_slot.
+EXTERNAL_PICK_TIER_SLOT = {"early": 2, "mid": 6, "late": 10}  # representative external
+# slot per FantasyCalc out-year tier bucket, used as anchor points
+
+
+@st.cache_data(ttl=1800)
+def get_external_player_snapshots(cache_key):
+    return load_table(
+        "SELECT source, sleeper_player_id, scrape_date, raw_value FROM external_player_value_snapshots"
+    )
+
+
+@st.cache_data(ttl=1800)
+def get_external_pick_snapshots(cache_key):
+    return load_table(
+        "SELECT source, season, round, granularity, slot, tier, scrape_date, raw_value "
+        "FROM external_pick_value_snapshots"
+    )
+
+
+def _latest_per_source_entity(df, key_col, as_of_date=None):
+    """Collapse a snapshot history down to one row per (source, key_col) —
+    the most recent scrape_date on/before as_of_date, or the most recent
+    overall if as_of_date is None (i.e. "current")."""
+    if df.empty:
+        return df
+    filtered = df[df["scrape_date"] <= as_of_date] if as_of_date else df
+    if filtered.empty:
+        return filtered
+    idx = filtered.groupby(["source", key_col])["scrape_date"].idxmax()
+    return filtered.loc[idx]
+
+
+def _latest_per_source_pick(df, as_of_date=None):
+    if df.empty:
+        return df
+    filtered = df[df["scrape_date"] <= as_of_date] if as_of_date else df
+    if filtered.empty:
+        return filtered
+    idx = filtered.groupby(["source", "season", "round", "granularity", "slot", "tier"])["scrape_date"].idxmax()
+    return filtered.loc[idx]
+
+
+def _external_source_pools(player_df, pick_df, as_of_date=None):
+    """Per-source pooled raw-value arrays (players + that source's picks) —
+    the population every individual percentile below is computed against."""
+    player_latest = _latest_per_source_entity(player_df, "sleeper_player_id", as_of_date)
+    pick_latest = _latest_per_source_pick(pick_df, as_of_date)
+    sources = (set(player_latest["source"]) if not player_latest.empty else set()) | \
+              (set(pick_latest["source"]) if not pick_latest.empty else set())
+
+    pools = {}
+    for source in sources:
+        parts = []
+        if not player_latest.empty:
+            parts.append(player_latest.loc[player_latest["source"] == source, "raw_value"].to_numpy())
+        if not pick_latest.empty:
+            parts.append(pick_latest.loc[pick_latest["source"] == source, "raw_value"].to_numpy())
+        pools[source] = np.sort(np.concatenate(parts)) if parts else np.array([])
+    return pools, player_latest, pick_latest
+
+
+def _percentile_of_value(sorted_pool, x, higher_is_better=True):
+    """Percentile (0-1) of x within a sorted 1-D array via linear
+    interpolation against the empirical distribution — not a discrete rank —
+    so an interpolated in-between pick value still gets a sensible
+    percentile instead of being forced onto an existing player's rank."""
+    n = len(sorted_pool)
+    if n == 0:
+        return None
+    pct = np.searchsorted(sorted_pool, x, side="left") / n
+    return pct if higher_is_better else 1 - pct
+
+
+def compute_consensus_player_values(cache_key, as_of_date=None):
+    """Blended external consensus value (0-100) per Sleeper player_id, as of
+    as_of_date (None = current/latest). A player absent from every source
+    (rare — deep bench/practice-squad players nobody's ranking service
+    tracks) simply isn't a key in the returned dict; callers should treat a
+    missing player as a value-of-0 floor, not an error."""
+    player_df = get_external_player_snapshots(cache_key)
+    pick_df = get_external_pick_snapshots(cache_key)
+    pools, player_latest, _ = _external_source_pools(player_df, pick_df, as_of_date)
+    if player_latest.empty:
+        return {}
+
+    percentile_lookup = {}
+    for source, group in player_latest.groupby("source"):
+        pooled = pools.get(source, np.array([]))
+        if len(pooled) == 0:
+            continue
+        higher_is_better = source != "dynastyprocess_ecr"  # ecr is lower-is-better rank
+        percentile_lookup[source] = {
+            pid: _percentile_of_value(pooled, val, higher_is_better)
+            for pid, val in zip(group["sleeper_player_id"], group["raw_value"])
+        }
+
+    all_ids = set().union(*percentile_lookup.values()) if percentile_lookup else set()
+    consensus = {}
+    for pid in all_ids:
+        pcts = [m[pid] for m in percentile_lookup.values() if pid in m]
+        if pcts:
+            consensus[pid] = round(100 * float(np.median(pcts)), 1)
+    return consensus
+
+
+def _map_to_external_slot(our_slot, our_team_count):
+    """Proportionally map this league's 1..our_team_count slot onto the
+    external 1..EXTERNAL_PICK_SLOTS_PER_ROUND scale (linear across the round)."""
+    if our_team_count <= 1:
+        return 1.0
+    frac = (our_slot - 1) / (our_team_count - 1)
+    return 1 + frac * (EXTERNAL_PICK_SLOTS_PER_ROUND - 1)
+
+
+def _interpolate_via_decay_shape(ext_slot, round_no, anchors_by_ext_slot):
+    """Value at ext_slot given 1+ real market anchor points (FantasyCalc's
+    Early/Mid/Late tier values, placed at their representative external
+    slot). Between two real anchors, interpolates log-linearly (geometric
+    interpolation) directly between them — NOT via the in-house decay shape's
+    own curvature, which is markedly steeper than FantasyCalc's real
+    early-to-late gap and forcing it onto real anchors produced a
+    non-monotonic result (a slot 3 pick coming out cheaper than slot 4).
+    Outside the anchors' span (or with only one anchor), extrapolates using
+    the in-house shape's *relative* decay ratio from the nearest anchor —
+    real data sets the level, in-house math only extends the tail."""
+    anchor_slots = sorted(anchors_by_ext_slot)
+    if len(anchor_slots) == 1 or ext_slot <= anchor_slots[0] or ext_slot >= anchor_slots[-1]:
+        nearest = min(anchor_slots, key=lambda s: abs(s - ext_slot))
+        shape_nearest = pick_slot_value(round_no, nearest)
+        if not shape_nearest:
+            return anchors_by_ext_slot[nearest]
+        return anchors_by_ext_slot[nearest] * (pick_slot_value(round_no, ext_slot) / shape_nearest)
+    log_vals = np.log([anchors_by_ext_slot[s] for s in anchor_slots])
+    return float(np.exp(np.interp(ext_slot, anchor_slots, log_vals)))
+
+
+def _scale_decay_shape_to_anchor(ext_slot, round_no, anchor_value):
+    """Same idea as _interpolate_via_decay_shape but for a single per-round
+    anchor (2028+ picks, where FantasyCalc gives one number for the whole
+    round, no tiers) — scale the in-house shape so its round-average matches
+    that one anchor, then read off ext_slot's scaled value."""
+    round_avg_shape = np.mean([pick_slot_value(round_no, s) for s in range(1, EXTERNAL_PICK_SLOTS_PER_ROUND + 1)])
+    if not round_avg_shape:
+        return None
+    return pick_slot_value(round_no, ext_slot) * (anchor_value / round_avg_shape)
+
+
+def _pick_raw_value(pick_latest, source, season, round_no, our_slot, our_team_count, higher_is_better=True):
+    """One source's raw value for a specific (season, round, our_slot) pick,
+    at whatever granularity that source actually has for that season:
+      - exact_slot (current draft class, both sources): map our_slot onto
+        the external 12-slot scale, linearly interpolate between the two
+        nearest listed external slots — direction-agnostic, safe as is.
+      - tier (next season out) / round (2+ seasons out): both sources
+        actually carry these (not FantasyCalc alone — DynastyProcess's
+        values.csv turns out to include round-level entries for 2027/2028
+        too, found only once real out-year data was tested; confirmed via
+        `sorted(pick_df[pick_df["source"]=="dynastyprocess_value"]["season"].unique())`
+        showing 2025-2028). Anchors real market data at representative
+        slots, in-house decay shape fills the gaps/tail. The anchor math
+        assumes "higher raw value = better" — for the ecr signal (lower
+        rank = better) the anchor is passed through as its reciprocal so
+        the shape math stays in a consistent direction, then inverted back.
+      - nothing at all: None — caller falls back to the plain in-house
+        formula for that source's contribution.
+    """
+    rows = pick_latest[(pick_latest["source"] == source) & (pick_latest["season"] == str(season)) &
+                        (pick_latest["round"] == round_no)]
+    if rows.empty:
+        return None
+    ext_slot = _map_to_external_slot(our_slot, our_team_count)
+
+    exact = rows[rows["granularity"] == "exact_slot"].sort_values("slot")
+    if not exact.empty:
+        return float(np.interp(ext_slot, exact["slot"].astype(float), exact["raw_value"].astype(float)))
+
+    to_goodness = (lambda v: v) if higher_is_better else (lambda v: 1.0 / v)
+    from_goodness = to_goodness  # reciprocal is its own inverse
+
+    tier = rows[rows["granularity"] == "tier"]
+    if not tier.empty:
+        anchors = {EXTERNAL_PICK_TIER_SLOT[t]: to_goodness(v) for t, v in zip(tier["tier"], tier["raw_value"])
+                   if t in EXTERNAL_PICK_TIER_SLOT}
+        if anchors:
+            result = _interpolate_via_decay_shape(ext_slot, round_no, anchors)
+            return None if result is None else from_goodness(result)
+
+    round_row = rows[rows["granularity"] == "round"]
+    if not round_row.empty:
+        anchor = to_goodness(float(round_row["raw_value"].iloc[0]))
+        result = _scale_decay_shape_to_anchor(ext_slot, round_no, anchor)
+        return None if result is None else from_goodness(result)
+
+    return None
+
+
+def compute_consensus_pick_value(season, round_no, our_slot, cache_key, our_team_count=8, as_of_date=None):
+    """Blended external consensus value (0-100) for one of this league's
+    specific picks, on the SAME scale as compute_consensus_player_values.
+    Returns None if no external source has anything for that season at all
+    (e.g. picks far enough out that even FantasyCalc's coarse round-level
+    number doesn't reach) — caller falls back entirely to the in-house
+    pick_slot_value/CLASS_STRENGTH_MULTIPLIER formula in that case."""
+    player_df = get_external_player_snapshots(cache_key)
+    pick_df = get_external_pick_snapshots(cache_key)
+    pools, _, pick_latest = _external_source_pools(player_df, pick_df, as_of_date)
+
+    percentiles = []
+    for source, pooled in pools.items():
+        if len(pooled) == 0:
+            continue
+        higher_is_better = source != "dynastyprocess_ecr"
+        raw = _pick_raw_value(pick_latest, source, season, round_no, our_slot, our_team_count, higher_is_better)
+        if raw is None:
+            continue
+        percentiles.append(_percentile_of_value(pooled, raw, higher_is_better))
+
+    if not percentiles:
+        return None
+    return round(100 * float(np.median(percentiles)), 1)
 
 
 def safe_zscore(series):
@@ -1099,17 +1347,20 @@ def compute_player_value(position, age, ppg_multiplier):
     return round(100 * baseline * age_curve_multiplier(position, age) * ppg_multiplier, 1)
 
 
-def build_value_table(league_id, season_year, players_df):
+def build_value_table(league_id, season_year, players_df, cache_key):
+    """Current roster value table — sourced from real external market
+    consensus (compute_consensus_player_values) rather than the in-house
+    age-curve/PPG heuristic. A player with zero external coverage at all
+    (rare — deep bench/practice-squad guys nobody's ranking service tracks)
+    floors to 0.0 rather than crashing."""
     rostered_ids = get_all_rostered_player_ids(league_id)
     relevant = players_df.loc[players_df.index.intersection(rostered_ids)]
-    ppg_map = get_blended_player_ppg(league_id)
-    ppg_map = {pid: ppg for pid, ppg in ppg_map.items() if pid in relevant.index}
-    multipliers = compute_performance_multipliers(ppg_map, relevant)
+    consensus = compute_consensus_player_values(cache_key)
 
     rows = []
     for pid, info in relevant.iterrows():
         age = compute_age(info["birth_date"], season_year)
-        value = compute_player_value(info["position"], age, multipliers.get(pid, 1.0))
+        value = consensus.get(pid, 0.0)
         rows.append({"player_id": pid, "full_name": info["full_name"], "position": info["position"],
                       "age": age, "value": value})
     return pd.DataFrame(rows).set_index("player_id")
@@ -1117,7 +1368,7 @@ def build_value_table(league_id, season_year, players_df):
 
 @st.cache_data(ttl=1800)
 def get_value_table(league_id, season_year, cache_key):
-    return build_value_table(league_id, season_year, get_players_df())
+    return build_value_table(league_id, season_year, get_players_df(), cache_key)
 
 
 def get_career_player_ppg():
@@ -1157,23 +1408,39 @@ def get_career_player_ppg():
     return {pid: totals[pid] / counts[pid] for pid in totals}
 
 
-def build_historical_value_table(season_year, players_df):
+def season_end_as_of_date(season_year):
+    """Representative as-of-date for grading a whole season's worth of trades
+    uniformly — the archive is weekly-granular, but this table is built ONCE
+    per season and reused across every trade that season for efficiency, so
+    it can't give each trade its own exact date (see get_value_as_of for that
+    — used by the "how this trade aged" comparison, which grades one trade
+    at a time). Using the season's END still fully solves the actual
+    complaint (hindsight bias from grading old trades at TODAY's price) even
+    without within-season precision."""
+    return f"{season_year}-12-31"
+
+
+def build_historical_value_table(season_year, players_df, cache_key):
     """Value table for grading HISTORICAL picks/trades — spans every player ever
-    rostered in this league, not just currently-rostered ones, valued off real
-    career-wide PPG. The 'current' value table above stays roster-scoped on
-    purpose for market-value use cases (Team Pages, live trade value); this one
-    exists so a since-dropped player (e.g. cut before breaking out elsewhere)
-    doesn't get graded as a flat 0 just because nobody currently owns them."""
+    rostered in this league, not just currently-rostered ones. Sourced from the
+    real external consensus archive as of that season's end (not today's price,
+    which would grade old trades through today's hindsight-colored market).
+
+    Requires the archive to actually reach back that far — DynastyProcess's
+    one-time git-history backfill (see blue_ballers_sync.py) covers 2024-01-01
+    onward, which is this league's full real history, so this should never be
+    an issue in production. If it's ever queried for an earlier/uncovered
+    date, every player floors to 0.0 (not a crash) — a real backfill gap
+    would show up as an entire season's table coming back all-zero, which is
+    a visible, checkable symptom rather than a silent wrong number."""
     all_ids = get_all_ever_rostered_ids()
     relevant = players_df.loc[players_df.index.intersection(all_ids)]
-    ppg_map = get_career_player_ppg()
-    ppg_map = {pid: ppg for pid, ppg in ppg_map.items() if pid in relevant.index}
-    multipliers = compute_performance_multipliers(ppg_map, relevant)
+    consensus = compute_consensus_player_values(cache_key, as_of_date=season_end_as_of_date(season_year))
 
     rows = []
     for pid, info in relevant.iterrows():
         age = compute_age(info["birth_date"], season_year)
-        value = compute_player_value(info["position"], age, multipliers.get(pid, 1.0))
+        value = consensus.get(pid, 0.0)
         rows.append({"player_id": pid, "full_name": info["full_name"], "position": info["position"],
                       "age": age, "value": value})
     return pd.DataFrame(rows).set_index("player_id")
@@ -1181,7 +1448,7 @@ def build_historical_value_table(season_year, players_df):
 
 @st.cache_data(ttl=1800)
 def get_historical_value_table(latest_season_year, cache_key):
-    return build_historical_value_table(latest_season_year, get_players_df())
+    return build_historical_value_table(latest_season_year, get_players_df(), cache_key)
 
 
 # ---------------------------------------------------------------------------
@@ -1395,18 +1662,23 @@ def estimate_championship_window(contender_pct, future_pct, season_year):
     return season_year, season_year + 2
 
 
-def project_team_value_curve(league_id, roster_id, season_year, players_df, years=5):
+def project_team_value_curve(league_id, roster_id, season_year, players_df, cache_key, years=5):
     """Per-POSITION value trajectory, not a single aggregate line — an aggregate
     curve looks qualitatively similar for almost every roster (ages blend into a
     smooth average decline regardless of team), while per-position lines actually
     show what makes each team's aging profile distinct (e.g. a young WR corps
-    holding value while an aging RB room craters in 2 years)."""
+    holding value while an aging RB room craters in 2 years).
+
+    Year 0 is anchored to each player's real external consensus value (the
+    same number shown everywhere else). No external source prices a FUTURE
+    season, so years 1+ scale that anchor by the in-house age-curve's
+    *relative* decay ratio (age_curve_multiplier(age+offset) / age_curve_
+    multiplier(age)) — real market data sets the level, in-house math only
+    projects the shape forward, same anchor+shape pattern used for out-year
+    pick values in compute_consensus_pick_value."""
     player_ids, _ = get_roster(league_id, roster_id)
     relevant = players_df.loc[players_df.index.intersection(player_ids)]
-    ppg_map = get_blended_player_ppg(league_id)
-    ppg_map = {pid: ppg for pid, ppg in ppg_map.items() if pid in relevant.index}
-    multipliers = compute_performance_multipliers(ppg_map, relevant)
-
+    consensus = compute_consensus_player_values(cache_key)
     base_ages = {pid: compute_age(info["birth_date"], season_year) for pid, info in relevant.iterrows()}
 
     trajectory = []
@@ -1415,10 +1687,12 @@ def project_team_value_curve(league_id, roster_id, season_year, players_df, year
         pos_totals = {}
         for pid, info in relevant.iterrows():
             base_age = base_ages[pid]
-            if base_age is None:
+            anchor = consensus.get(pid)
+            if base_age is None or anchor is None:
                 continue
             pos = info["position"] or "Other"
-            value = compute_player_value(info["position"], base_age + offset, multipliers.get(pid, 1.0))
+            base_shape = age_curve_multiplier(info["position"], base_age)
+            value = anchor * (age_curve_multiplier(info["position"], base_age + offset) / base_shape) if base_shape else 0.0
             pos_totals[pos] = pos_totals.get(pos, 0.0) + value
         for pos, total in pos_totals.items():
             trajectory.append({"year": year, "position": pos, "projected_value": total})
@@ -1493,26 +1767,48 @@ CLASS_STRENGTH_MULTIPLIER = {
 # guessing a direction with no real consensus behind it.
 
 
-def pick_value(round_no, original_roster_power_percentile, slot_distribution=None, season=None):
-    """Value of a future (undrafted) pick. When a real simulated `slot_distribution`
-    is available (this league's immediate upcoming draft, from the Championship Odds
-    simulator's `draft_slot_distribution`), values the pick as its expectation across
-    that actual distribution — correct under Jensen's inequality for pick_slot_value's
-    convex shape, and a real improvement over a single power-percentile point estimate.
-    Falls back to an estimated slot from the team's current power percentile for picks
-    in seasons too far out to simulate (this is a fixed 8-team league: weakest team ≈
-    slot 1, strongest ≈ slot 8). `season` scales the result by that draft class's
-    real-world strength consensus (CLASS_STRENGTH_MULTIPLIER) — a 2026 pick is worth
-    less than an otherwise-identical 2027 pick, not just a function of slot."""
+def pick_value(round_no, original_roster_power_percentile, slot_distribution=None, season=None,
+                cache_key=None, our_team_count=8, as_of_date=None):
+    """Value of a future (undrafted) pick — prefers real external market
+    consensus (compute_consensus_pick_value) and falls back to the in-house
+    pick_slot_value/CLASS_STRENGTH_MULTIPLIER formula only where external
+    sources don't reach yet (picks far enough out that even FantasyCalc's
+    coarse round-level number doesn't cover them — in practice this is only
+    ~4+ seasons out, well beyond what's normally displayed). Pass
+    cache_key=None (the default) to skip the consensus lookup entirely and
+    always use the in-house formula — used by callers not yet wired to a
+    live/historical value source. `as_of_date=None` means "current" — pass
+    an ISO date to grade a pick's value as of a historical trade instead.
+
+    CLASS_STRENGTH_MULTIPLIER applies ONLY to the in-house fallback: real
+    external prices already bake in the market's own class-strength read
+    (that's WHY DynastyProcess/FantasyCalc price a 2027 pick differently
+    from a 2026 one) — applying our own multiplier on top of an
+    already-market-calibrated number would double-count it.
+
+    When a real simulated `slot_distribution` is available (this league's
+    immediate upcoming draft, from the Championship Odds simulator's
+    `draft_slot_distribution`), values the pick as its expectation across
+    that actual distribution — correct under Jensen's inequality for a
+    convex per-slot curve, and a real improvement over a single
+    power-percentile point estimate. Falls back to an estimated slot from
+    the team's current power percentile for picks in seasons too far out to
+    simulate (this is a fixed 8-team league: weakest team ≈ slot 1,
+    strongest ≈ slot 8)."""
+    def slot_value(slot):
+        if cache_key is not None:
+            consensus = compute_consensus_pick_value(season, round_no, slot, cache_key, our_team_count, as_of_date)
+            if consensus is not None:
+                return consensus
+        return pick_slot_value(round_no, slot) * CLASS_STRENGTH_MULTIPLIER.get(str(season), 1.0)
+
     if slot_distribution:
-        base = sum(p * pick_slot_value(round_no, slot) for slot, p in enumerate(slot_distribution, start=1))
-    else:
-        estimated_slot = 1 + (1 - original_roster_power_percentile) * 7
-        base = pick_slot_value(round_no, estimated_slot)
-    return round(base * CLASS_STRENGTH_MULTIPLIER.get(str(season), 1.0), 1)
+        return round(sum(p * slot_value(slot) for slot, p in enumerate(slot_distribution, start=1)), 1)
+    estimated_slot = 1 + (1 - original_roster_power_percentile) * 7
+    return round(slot_value(estimated_slot), 1)
 
 
-def value_pick_row(row, power_pct, current_season_str, odds):
+def value_pick_row(row, power_pct, current_season_str, odds, cache_key=None):
     """Value one row of a pick inventory table. `current_season_str` is whichever
     season `odds` (the Championship Odds simulator's output) was run for — only a
     pick in THAT season has a real simulated slot distribution to use; anything
@@ -1521,8 +1817,9 @@ def value_pick_row(row, power_pct, current_season_str, odds):
         dist = odds.get(int(row["original_roster_id"]), {}).get("draft_slot_distribution")
         if dist:
             return pick_value(row["round"], power_pct.get(row["original_roster_id"], 0.5),
-                               slot_distribution=dist, season=row["season"])
-    return pick_value(row["round"], power_pct.get(row["original_roster_id"], 0.5), season=row["season"])
+                               slot_distribution=dist, season=row["season"], cache_key=cache_key)
+    return pick_value(row["round"], power_pct.get(row["original_roster_id"], 0.5),
+                       season=row["season"], cache_key=cache_key)
 
 
 def get_global_team_lookup():
@@ -1639,7 +1936,15 @@ def ratio_to_grade(ratio):
     return "F"
 
 
-def grade_trade(txn, value_table, power_pct, global_team_lookup, league_id):
+def grade_trade(txn, value_table, power_pct, global_team_lookup, league_id, cache_key=None):
+    """Grades one trade using `value_table` (players — already built as of
+    that trade's season, see build_historical_value_table) and, for any
+    picks involved, `cache_key` to look up each pick's own value as of that
+    SAME season's end (season_end_as_of_date) — i.e. every asset in this
+    trade is priced consistently at the same historical point, not a mix of
+    historical players and today's pick prices. cache_key=None (the
+    default) falls back to pick_value's pure in-house formula, unchanged
+    from before this feature existed — used by any caller not yet passing one."""
     roster_ids = parse_json_field(txn["roster_ids"], [])
     adds = parse_json_field(txn["adds"], {})
     drops = parse_json_field(txn["drops"], {})
@@ -1670,7 +1975,8 @@ def grade_trade(txn, value_table, power_pct, global_team_lookup, league_id):
             future_given[roster_id] += future_weighted_value(val, age)
 
     for pick in draft_picks:
-        val = pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5), season=pick.get("season"))
+        val = pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5), season=pick.get("season"),
+                          cache_key=cache_key, as_of_date=season_end_as_of_date(txn["season"]) if cache_key else None)
         new_owner, prev_owner = pick.get("owner_id"), pick.get("previous_owner_id")
         if new_owner in received:
             received[new_owner] += val
@@ -1714,6 +2020,53 @@ def grade_trade(txn, value_table, power_pct, global_team_lookup, league_id):
             r["role"] = "—"
 
     return results
+
+
+def trade_as_of_date(txn):
+    """Exact historical date for one trade, from its real `created` timestamp
+    (epoch ms) — used for the 'how this trade aged' comparison below, where
+    true per-transaction precision is cheap (one trade at a time, unlike
+    build_historical_value_table's season-end approximation, which trades
+    precision for being reusable across every trade that season). Falls back
+    to that same season-end approximation if `created` is missing (a
+    handful of real transactions in this league's data lack it — see the
+    Team Timeline "Offseason" grouping fix for the same underlying gap)."""
+    created = txn.get("created")
+    if created:
+        return datetime.fromtimestamp(created / 1000, tz=timezone.utc).date().isoformat()
+    return season_end_as_of_date(txn["season"])
+
+
+def build_trade_aging_detail(txn, power_pct, players_df, cache_key):
+    """Per-asset value-at-the-time vs. today's live value for one trade —
+    the 'how this trade aged' hindsight view. Purely additive to grade_trade's
+    at-the-time grade above, never a replacement for it. Uses the trade's
+    exact date (trade_as_of_date), not build_historical_value_table's
+    coarser season-end approximation, since this is a single on-demand
+    lookup rather than a table reused across many trades."""
+    as_of = trade_as_of_date(txn)
+    historical_values = compute_consensus_player_values(cache_key, as_of_date=as_of)
+    live_values = compute_consensus_player_values(cache_key)
+
+    adds = parse_json_field(txn["adds"], {})
+    drops = parse_json_field(txn["drops"], {})
+    draft_picks = parse_json_field(txn["draft_picks"], [])
+
+    rows = []
+    for player_id in set(adds) | set(drops):
+        name = players_df.loc[player_id, "full_name"] if player_id in players_df.index else player_id
+        then_val, now_val = historical_values.get(player_id, 0.0), live_values.get(player_id, 0.0)
+        rows.append({"asset": name, "then": then_val, "now": now_val, "swing": round(now_val - then_val, 1)})
+
+    for pick in draft_picks:
+        label = f"{pick.get('season')} Round {pick.get('round')} pick"
+        then_val = pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5),
+                               season=pick.get("season"), cache_key=cache_key, as_of_date=as_of)
+        now_val = pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5),
+                              season=pick.get("season"), cache_key=cache_key)
+        rows.append({"asset": label, "then": then_val, "now": now_val, "swing": round(now_val - then_val, 1)})
+
+    return pd.DataFrame(rows)
 
 
 CONTEXT_FIT_THRESHOLD = 10.0  # ignore trivial win-now/future imbalances as noise
@@ -2336,7 +2689,7 @@ def build_gm_profiles(latest_league_id, latest_season_year, cache_key):
     for _, txn in get_all_trades(cache_key).iterrows():
         vt = get_historical_value_table(int(txn["season"]), cache_key)
         pp = get_season_power_pct(txn["league_id"], cache_key)
-        for side in grade_trade(txn, vt, pp, global_team_lookup_local, txn["league_id"]):
+        for side in grade_trade(txn, vt, pp, global_team_lookup_local, txn["league_id"], cache_key=cache_key):
             owner = owner_lookup.get((txn["league_id"], side["roster_id"]))
             if owner:
                 trading_total[owner] = trading_total.get(owner, 0) + 1
@@ -2591,7 +2944,7 @@ def compute_draft_and_trade_superlatives(latest_league_id, latest_season_year, c
         vt = get_historical_value_table(int(txn["season"]), cache_key)
         pp = get_season_power_pct(txn["league_id"], cache_key)
         trade_summary = " ".join(describe_trade(txn, players_df_local, txn["league_id"], global_team_lookup_local))
-        for side in grade_trade(txn, vt, pp, global_team_lookup_local, txn["league_id"]):
+        for side in grade_trade(txn, vt, pp, global_team_lookup_local, txn["league_id"], cache_key=cache_key):
             trade_rows.append({
                 "season": txn["season"], "team": side["team_name"],
                 "net_value": side["win_now_impact"] + side["future_impact"],
@@ -3210,9 +3563,8 @@ def page_matchup_center():
 def page_team_pages():
     st.header("Team Page")
     st.caption(
-        "Grades and scores below come from an in-house heuristic (position scarcity x age curve x "
-        "on-field performance) since no external dynasty-value source is wired in yet — good for "
-        "comparing teams within this league, not a market-calibrated trade value."
+        "Grades and scores below use real dynasty market consensus (DynastyProcess + FantasyCalc), "
+        "not just an in-house guess — the same value that powers Trade Center's grading."
     )
     team_choice = st.selectbox("Team", standings["team_name"].tolist())
     sel = standings.loc[standings["team_name"] == team_choice].iloc[0]
@@ -3270,7 +3622,7 @@ def page_team_pages():
                    "the most likely spot to target via trade or draft capital.")
     
     st.subheader("Age Curve")
-    curve_df = project_team_value_curve(league_id, roster_id, season_year, players_df)
+    curve_df = project_team_value_curve(league_id, roster_id, season_year, players_df, synced_at)
     fig = px.line(curve_df, x="year", y="projected_value", color="position", markers=True,
                   labels={"year": "Season", "projected_value": "Projected Value", "position": "Position"})
     st.plotly_chart(fig, use_container_width=True)
@@ -3282,7 +3634,7 @@ def page_team_pages():
     team_picks = pick_inventory[pick_inventory["owner_roster_id"] == roster_id].copy()
     power_pct = dict(zip(rankings["roster_id"], rankings["power_score"].rank(pct=True)))
     team_picks["Value"] = team_picks.apply(
-        lambda r: value_pick_row(r, power_pct, str(season_year), odds), axis=1
+        lambda r: value_pick_row(r, power_pct, str(season_year), odds, cache_key=synced_at), axis=1
     )
     team_picks["Original Team"] = team_picks["original_roster_id"].map(team_lookup)
     team_picks = team_picks.sort_values(["season", "round"])
@@ -3421,13 +3773,15 @@ def page_stock_market():
 def page_trade_center():
     st.header("Trade Center")
     st.caption(
-        "Every trade across every synced season, auto-graded with hindsight — each player is valued "
-        "off their real career-wide production, so a since-dropped player still counts instead of "
-        "scoring 0. Grade starts from value received vs. given up per side, then gets knocked down a "
-        "full letter if it doesn't fit that team's own timeline at the time (e.g. a rebuilding team "
-        "giving up future assets for a marginal win-now piece drops from an A to a B, even if the raw "
-        "value was fair) — see the Context Fit note under each grade. Winner/Loser is based on net "
-        "value gained, not the letter grade."
+        "Every trade across every synced season, auto-graded WITHOUT hindsight — each asset is valued "
+        "off real external market consensus (DynastyProcess + FantasyCalc) as of that trade's own date, "
+        "not today's price, so a since-dropped player still counts instead of scoring 0, and the grade "
+        "reflects what was known at the time. Grade starts from value received vs. given up per side, "
+        "then gets knocked down a full letter if it doesn't fit that team's own timeline at the time "
+        "(e.g. a rebuilding team giving up future assets for a marginal win-now piece drops from an A to "
+        "a B, even if the raw value was fair) — see the Context Fit note under each grade. Winner/Loser "
+        "is based on net value gained, not the letter grade. Want to see it with today's hindsight "
+        "instead? Open \"How this trade aged\" under any trade."
     )
     
     st.subheader("Trade Tree")
@@ -3480,7 +3834,8 @@ def page_trade_center():
         for _, txn in all_trades.iterrows():
             trade_value_table = get_historical_value_table(int(txn["season"]), synced_at)
             trade_power_pct = get_season_power_pct(txn["league_id"], synced_at)
-            sides = grade_trade(txn, trade_value_table, trade_power_pct, global_team_lookup, txn["league_id"])
+            sides = grade_trade(txn, trade_value_table, trade_power_pct, global_team_lookup, txn["league_id"],
+                                 cache_key=synced_at)
             trade_league_grades = get_league_grades(txn["league_id"], int(txn["season"]), synced_at)
 
             st.write(f"**{txn['season']} — Week {txn['week']}**")
@@ -3504,6 +3859,24 @@ def page_trade_center():
                                  f"{side['win_now_impact']:+.0f} now / {side['future_impact']:+.0f} future")
                     if fit_note:
                         col.caption(fit_note)
+
+            with st.expander("How this trade aged"):
+                aging = build_trade_aging_detail(txn, trade_power_pct, players_df, synced_at)
+                if aging.empty:
+                    st.caption("No assets to compare.")
+                else:
+                    st.dataframe(
+                        aging.rename(columns={"asset": "Asset", "then": "Value Then",
+                                               "now": "Value Now", "swing": "Swing"}),
+                        use_container_width=True, hide_index=True,
+                    )
+                    st.caption(
+                        "Then = external market consensus as of this trade's real date; Now = today's "
+                        "live consensus — a pure hindsight view, doesn't change the grade above. Trades "
+                        "before this feature's archive started only have DynastyProcess's own signal for "
+                        "their historical side (FantasyCalc has no historical API), so \"Then\" may be "
+                        "less precise than trades graded going forward."
+                    )
             st.divider()
 
 def page_rookie_draft():
@@ -3579,18 +3952,19 @@ def page_rookie_draft():
     
     st.subheader("Draft Pick Value")
     st.caption(
-        "Every future pick across the league. Value curves steeply within a round early (pick 1.01 vs "
-        "1.08 is a big gap) and flattens out in later rounds, like a real dynasty pick-value chart, not "
-        "a flat linear scale. For this season's picks, value is the expectation over the Championship "
+        "Every future pick across the league. Value comes from real market consensus (DynastyProcess + "
+        "FantasyCalc), on the same 0-100 scale as player values, so picks and players are directly "
+        "comparable in a trade. For this season's picks, value is the expectation over the Championship "
         "Odds simulator's actual projected draft-slot odds (below); picks further out fall back to an "
         "estimated slot from the original team's current strength, since there's nothing left to simulate "
-        "that far ahead. Also scaled by real-world draft class strength consensus — 2026 is a weak class "
+        "that far ahead. Picks far enough out that even the external sources don't reach yet fall back to "
+        "an in-house formula, scaled by real-world draft class strength consensus — 2026 is a weak class "
         "(0.88x), 2027 is a strong one (1.12x); other years are neutral until there's a real read on them."
     )
     league_pick_inventory = get_pick_inventory(league_id, int(season_choice), synced_at).copy()
     league_power_pct = dict(zip(rankings["roster_id"], rankings["power_score"].rank(pct=True)))
     league_pick_inventory["Value"] = league_pick_inventory.apply(
-        lambda r: value_pick_row(r, league_power_pct, str(season_choice), odds), axis=1
+        lambda r: value_pick_row(r, league_power_pct, str(season_choice), odds, cache_key=synced_at), axis=1
     )
     league_pick_inventory["Original Team"] = league_pick_inventory["original_roster_id"].map(team_lookup)
     league_pick_inventory["Current Owner"] = league_pick_inventory["owner_roster_id"].map(team_lookup)
