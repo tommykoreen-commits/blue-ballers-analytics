@@ -10,7 +10,7 @@ import json
 import os
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -22,15 +22,14 @@ N_TRIALS = 10000
 SHRINKAGE_GAMES = 4  # weight given to a team's own results vs. its prior-season baseline
 RECENCY_DECAY = 0.9  # per-week decay on how much a past week counts toward "current form"
 
-# Live/current player and pick values now come from real external market consensus
+# Live/current player and pick values come from real external market consensus
 # (DynastyProcess + FantasyCalc — see compute_consensus_player_values/compute_consensus_pick_value
-# below), not this in-house heuristic. What's left of the heuristic is still load-bearing in 3
-# places external sources structurally can't cover: build_stock_market_history's historical
-# per-week curve (deferred — a good future upgrade target using the same DynastyProcess archive),
-# project_team_value_curve's FUTURE age-projection shape (anchored to the real consensus value at
+# below). Stock Market's per-week history also reads from that same archive now (see
+# build_stock_market_history/week_end_date). What's left of the old in-house heuristic is only
+# the age-curve SHAPE, still load-bearing in 2 places no external source can price:
+# project_team_value_curve's FUTURE age-projection (anchored to the real consensus value at
 # year 0, but no external source prices a future season), and pick_value's fallback for picks far
 # enough out that even FantasyCalc's coarse round-level number doesn't reach yet.
-POSITION_BASELINE = {"QB": 1.4, "RB": 1.0, "WR": 1.0, "TE": 0.75, "K": 0.2}  # QB boosted: this is a 2QB/superflex league
 POSITION_PEAK_AGE = {"QB": 29, "RB": 25, "WR": 27, "TE": 27, "K": 30}
 POSITION_DECLINE_RATE = {"QB": 0.04, "RB": 0.12, "WR": 0.07, "TE": 0.08, "K": 0.05}  # value lost per year past peak
 ROUND_BASE_VALUE = {1: 100, 2: 50, 3: 25, 4: 12}
@@ -43,7 +42,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-19-matplotlib-dep-and-version-pins"
+APP_BUILD = "2026-08-19-stock-market-real-market-data"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -1267,86 +1266,6 @@ def get_all_rostered_player_ids(league_id):
     return ids
 
 
-def get_player_points_map(league_id):
-    """Recency-weighted PPG per player — mirrors RECENCY_DECAY, the same per-week
-    decay `estimate_team_distributions` already uses for team strength, so a
-    player who was hot for a few weeks early in the season and has since been
-    cut/benched/declined doesn't still show a high value off just that early
-    production (the reported Ayomanor case). Only counts real (played) weeks,
-    via the same 'SUM(points) > 0 that week' signal `get_last_completed_week`
-    uses — Sleeper pre-populates the WHOLE season's matchup rows upfront with
-    every future week's players_points zeroed out, so a per-row truthy-dict
-    check doesn't catch it (the dict itself isn't empty, just all zeros)."""
-    if not league_id:
-        return {}
-    real_weeks_df = load_table(
-        "SELECT week FROM matchups WHERE league_id = ? GROUP BY week HAVING SUM(points) > 0",
-        params=(league_id,),
-    )
-    real_weeks = set(real_weeks_df["week"].tolist())
-    if not real_weeks:
-        return {}
-    max_week = max(real_weeks)
-
-    df = load_table(
-        "SELECT week, players_points FROM matchups WHERE league_id = ? AND players_points IS NOT NULL",
-        params=(league_id,),
-    )
-    totals, weight_sums = {}, {}
-    for _, row in df.iterrows():
-        if row["week"] not in real_weeks:
-            continue
-        pts_map = parse_json_field(row["players_points"], {})
-        if not pts_map:
-            continue
-        decay = RECENCY_DECAY ** (max_week - row["week"])
-        for pid, pts in pts_map.items():
-            totals[pid] = totals.get(pid, 0.0) + pts * decay
-            weight_sums[pid] = weight_sums.get(pid, 0.0) + decay
-    return {pid: totals[pid] / weight_sums[pid] for pid in totals}
-
-
-def get_blended_player_ppg(league_id):
-    prior_league_id = get_previous_league_id(league_id)
-    current = get_player_points_map(league_id)
-    prior = get_player_points_map(prior_league_id) if prior_league_id else {}
-    blended = {}
-    for pid in set(current) | set(prior):
-        cur_val, prior_val = current.get(pid), prior.get(pid)
-        if cur_val is not None and prior_val is not None:
-            blended[pid] = 0.7 * cur_val + 0.3 * prior_val
-        else:
-            blended[pid] = cur_val if cur_val is not None else prior_val
-    return blended
-
-
-def compute_performance_multipliers(ppg_map, players_df):
-    pos_groups = {}
-    for pid, ppg in ppg_map.items():
-        if pid not in players_df.index:
-            continue
-        pos = players_df.loc[pid, "position"]
-        if pos:
-            pos_groups.setdefault(pos, []).append((pid, ppg))
-
-    multipliers = {}
-    for entries in pos_groups.values():
-        values = np.array([e[1] for e in entries])
-        if len(values) < 2 or values.std() == 0:
-            for pid, _ in entries:
-                multipliers[pid] = 1.0
-            continue
-        for pid, ppg in entries:
-            z = (ppg - values.mean()) / values.std()
-            multipliers[pid] = float(np.clip(1.0 + 0.25 * z, 0.5, 1.6))
-    return multipliers
-
-
-def compute_player_value(position, age, ppg_multiplier):
-    baseline = POSITION_BASELINE.get(position, 0.5)
-    return round(100 * baseline * age_curve_multiplier(position, age) * ppg_multiplier, 1)
-
-
 def build_value_table(league_id, season_year, players_df, cache_key):
     """Current roster value table — sourced from real external market
     consensus (compute_consensus_player_values) rather than the in-house
@@ -1369,43 +1288,6 @@ def build_value_table(league_id, season_year, players_df, cache_key):
 @st.cache_data(ttl=1800)
 def get_value_table(league_id, season_year, cache_key):
     return build_value_table(league_id, season_year, get_players_df(), cache_key)
-
-
-def get_career_player_ppg():
-    """PPG blended across every synced season (not just current+prior, like
-    get_blended_player_ppg) — used only for historical grading, where we want a
-    player's real production over their whole time in this league, not a
-    recency-weighted snapshot. Only counts real (played) weeks, via the same
-    'SUM(points) > 0 that week' signal get_last_completed_week/get_player_points_map
-    use — Sleeper pre-populates the WHOLE season's matchup rows upfront with every
-    future week's players_points zeroed out, so a per-row truthy-dict check doesn't
-    catch it (the dict itself isn't empty, just all zeros). Without this filter, the
-    currently in-progress season's future zero-weeks would dilute every rostered
-    player's career PPG for as long as that season stays in progress."""
-    league_ids = load_table("SELECT league_id FROM league_seasons")["league_id"].tolist()
-    totals, counts = {}, {}
-    for lid in league_ids:
-        real_weeks_df = load_table(
-            "SELECT week FROM matchups WHERE league_id = ? GROUP BY week HAVING SUM(points) > 0",
-            params=(lid,),
-        )
-        real_weeks = set(real_weeks_df["week"].tolist())
-        if not real_weeks:
-            continue
-        df = load_table(
-            "SELECT week, players_points FROM matchups WHERE league_id = ? AND players_points IS NOT NULL",
-            params=(lid,),
-        )
-        for _, row in df.iterrows():
-            if row["week"] not in real_weeks:
-                continue
-            pts_map = parse_json_field(row["players_points"], {})
-            if not pts_map:
-                continue
-            for pid, pts in pts_map.items():
-                totals[pid] = totals.get(pid, 0.0) + pts
-                counts[pid] = counts.get(pid, 0) + 1
-    return {pid: totals[pid] / counts[pid] for pid in totals}
 
 
 def season_end_as_of_date(season_year):
@@ -1452,22 +1334,28 @@ def get_historical_value_table(latest_season_year, cache_key):
 
 
 # ---------------------------------------------------------------------------
-# Stock Market — every ever-rostered player's value as a real time series
-# (recomputed at every past week using only PPG accumulated up to that point),
-# not just a single end-of-season snapshot. Reuses the exact same value formula
-# as everywhere else in the app (position baseline x age curve x performance
-# multiplier); the only new piece is computing PPG point-in-time instead of a
-# full-season/blended average. Cumulative PPG resets at each new season — a
-# fresh season's role/opportunity is a real reset, not a continuation of last
-# year's, and this matches how build_value_table already treats seasons.
+# Stock Market — every ever-rostered player's REAL market value as a genuine
+# historical price series, sourced from the same external consensus archive
+# as everywhere else (compute_consensus_player_values), looked up as of each
+# past week's own date rather than replayed at today's price. A player only
+# gets a row for weeks where they'd actually recorded real production in this
+# league by then (build_player_ppg_timeline's real-week gate) — the PPG
+# number itself no longer drives the VALUE, only which weeks a player shows
+# up in at all, since the external consensus already reflects the market's
+# own read on age/performance/opportunity. Unlike the old in-house heuristic,
+# this genuinely doesn't reset at season boundaries — real dynasty value
+# carries across seasons, so the timeline is continuous 2024 through today.
 # ---------------------------------------------------------------------------
 def build_player_ppg_timeline():
-    """Cumulative PPG per player at every real (season, week) point. A week only
-    counts once its matchups have real scoring (SUM(points) > 0), the same bar
-    get_last_completed_week uses elsewhere — Sleeper pre-populates future weeks'
-    matchup rows with each roster's player list and all-zero players_points
-    before real games happen, and without this gate those zero-filled weeks
-    would masquerade as real (if quiet) games and drag every player's PPG down."""
+    """Cumulative PPG per player at every real (season, week) point — no longer
+    used for VALUE (see build_stock_market_history), only to gate which
+    (season, week, player_id) rows exist at all: a player shouldn't show up
+    in a week they hadn't actually recorded real production in this league
+    yet. A week only counts once its matchups have real scoring (SUM(points)
+    > 0), the same bar get_last_completed_week uses elsewhere — Sleeper
+    pre-populates future weeks' matchup rows with each roster's player list
+    and all-zero players_points before real games happen, and without this
+    gate those zero-filled weeks would masquerade as real (if quiet) games."""
     all_seasons = load_table("SELECT league_id, season FROM league_seasons ORDER BY season ASC")
     timeline = []
     for _, row in all_seasons.iterrows():
@@ -1500,35 +1388,47 @@ def build_player_ppg_timeline():
     return pd.DataFrame(timeline)
 
 
-@st.cache_data(ttl=1800)
-def get_player_ppg_timeline(cache_key):
-    return build_player_ppg_timeline()
+SEASON_WEEK1_THURSDAY = {
+    "2024": "2024-09-05",
+    "2025": "2025-09-04",
+}  # this league's real NFL season openers (Thursday Night Kickoff) — manually
+# maintained per season, same pattern as CLASS_STRENGTH_MULTIPLIER. Add next
+# year's date here once it's known; only affects week_end_date's precision
+# for that season, nothing else.
 
 
-def build_stock_market_history(players_df):
+def week_end_date(season, week):
+    """Approximate real-world date by which a fantasy week's games are fully
+    played out (the Tuesday after that week's Monday Night Football game) —
+    used only to pick the nearest real external-market snapshot for that
+    week in Stock Market, not any actual scheduling logic, so being off by a
+    day or two doesn't matter. Falls back to a plain Jan-1 anchor for any
+    season missing from SEASON_WEEK1_THURSDAY (keeps this from crashing on a
+    brand-new season before its real opener date is known, at the cost of
+    coarser precision for that season only)."""
+    week1 = SEASON_WEEK1_THURSDAY.get(str(season))
+    if not week1:
+        return f"{season}-01-01"
+    anchor = datetime.strptime(week1, "%Y-%m-%d").date()
+    return (anchor + timedelta(days=5 + (int(week) - 1) * 7)).isoformat()
+
+
+def build_stock_market_history(cache_key):
     ppg_timeline = build_player_ppg_timeline()
     if ppg_timeline.empty:
         return pd.DataFrame(columns=["season", "week", "player_id", "value"])
 
-    all_ids = get_all_ever_rostered_ids()
-    relevant = players_df.loc[players_df.index.intersection(all_ids)]
-
     rows = []
     for (season, week), group in ppg_timeline.groupby(["season", "week"]):
-        ppg_map = {pid: ppg for pid, ppg in zip(group["player_id"], group["cum_ppg"])
-                   if pid in relevant.index}
-        multipliers = compute_performance_multipliers(ppg_map, relevant)
-        for pid, ppg in ppg_map.items():
-            info = relevant.loc[pid]
-            age = compute_age(info["birth_date"], int(season))
-            value = compute_player_value(info["position"], age, multipliers.get(pid, 1.0))
-            rows.append({"season": season, "week": week, "player_id": pid, "value": value})
+        consensus = compute_consensus_player_values(cache_key, as_of_date=week_end_date(season, week))
+        for pid in group["player_id"]:
+            rows.append({"season": season, "week": week, "player_id": pid, "value": consensus.get(pid, 0.0)})
     return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=1800)
 def get_stock_market_history(cache_key):
-    return build_stock_market_history(get_players_df())
+    return build_stock_market_history(cache_key)
 
 
 def team_overview_metrics(value_table, player_ids, starter_ids):
@@ -3700,12 +3600,11 @@ def page_team_pages():
 def page_stock_market():
     st.header("Stock Market")
     st.caption(
-        "Every player who's ever been rostered in this league, valued with the same "
-        "position/age/performance heuristic used everywhere else in the app — but recomputed "
-        "week by week using only production accumulated up to that point, so it moves like a "
-        "real price instead of sitting at a single end-of-season snapshot. Resets each new "
-        "season, since a fresh season's role/opportunity is a real reset, not a continuation "
-        "of last year's."
+        "Every player who's ever been rostered in this league, valued with real external "
+        "market consensus (DynastyProcess + FantasyCalc) as of that exact week — not today's "
+        "price replayed backwards — so this is a genuine historical price series, continuous "
+        "across every synced season, not a single end-of-season snapshot. A player only shows "
+        "up starting the week they first recorded real production in this league."
     )
 
     history = get_stock_market_history(synced_at)
