@@ -43,7 +43,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-19-gdown-fuzzy-arg-fix"
+APP_BUILD = "2026-08-19-styler-applymap-removed-fix"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -1580,7 +1580,7 @@ def style_grades(df, columns):
         color = GRADE_COLORS.get(str(v))
         return f"background-color: {color}; color: white;" if color else ""
 
-    return df.style.applymap(_color, subset=columns)
+    return df.style.map(_color, subset=columns)
 
 
 def build_league_grades(league_id, value_table, standings):
