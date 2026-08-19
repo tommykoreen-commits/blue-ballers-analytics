@@ -42,7 +42,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-19-draft-day-grades-who-knows-ball"
+APP_BUILD = "2026-08-19-draft-timestamp-migration-fix"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -2478,16 +2478,31 @@ def draft_as_of_date(draft_row):
     null) — same fallback pattern as trade_as_of_date."""
     for field in ("last_picked", "start_time"):
         ts = draft_row.get(field)
-        if ts:
+        # pd.notna(), not a plain truthy check: a missing value coerced into a
+        # pandas Series (as get_draft_row's fallback path does) lands as NaN,
+        # not None -- and NaN is truthy in Python, so `if ts:` would let it
+        # through and crash datetime.fromtimestamp(nan) downstream.
+        if pd.notna(ts):
             return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date().isoformat()
     return season_end_as_of_date(draft_row["season"])
 
 
 def get_draft_row(draft_id):
-    return load_table(
-        "SELECT draft_id, season, start_time, last_picked FROM drafts WHERE draft_id = ?",
-        params=(draft_id,),
-    ).iloc[0]
+    """start_time/last_picked are new columns (see blue_ballers_sync.py's
+    ensure_column) -- a deployed app whose local DB copy predates that
+    sync's schema migration would hard-crash querying them directly, so this
+    falls back to a query without them (draft_as_of_date's season-end
+    fallback still applies) rather than taking the whole page down for
+    however long it takes the next successful sync+refresh to land."""
+    try:
+        return load_table(
+            "SELECT draft_id, season, start_time, last_picked FROM drafts WHERE draft_id = ?",
+            params=(draft_id,),
+        ).iloc[0]
+    except Exception:
+        row = load_table("SELECT draft_id, season FROM drafts WHERE draft_id = ?", params=(draft_id,)).iloc[0]
+        row["start_time"], row["last_picked"] = None, None
+        return row
 
 
 def build_draft_day_grades(draft_id, league_id, cache_key):

@@ -222,6 +222,25 @@ class ExternalPickValueSnapshot(Base):
 Base.metadata.create_all(engine)
 print("Tables ready:", list(Base.metadata.tables.keys()))
 
+
+def ensure_column(engine, table, column, sql_type):
+    """SQLAlchemy's create_all() above only creates missing TABLES -- it never
+    ALTERs an already-existing table to add a new column, so adding a Column
+    to a model (like Draft.start_time/last_picked) silently does nothing for
+    a DB that already has that table. This adds any column that's genuinely
+    missing, one ALTER TABLE per (table, column), safe to re-run every sync
+    since it checks PRAGMA table_info first."""
+    with engine.connect() as conn:
+        existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            conn.commit()
+            print(f"  migrated: added {table}.{column}")
+
+
+ensure_column(engine, "drafts", "start_time", "BIGINT")
+ensure_column(engine, "drafts", "last_picked", "BIGINT")
+
 # ---------------------------------------------------------------------------
 # Sleeper API client
 # ---------------------------------------------------------------------------
