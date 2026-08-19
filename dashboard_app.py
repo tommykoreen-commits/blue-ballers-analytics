@@ -42,7 +42,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-19-weekly-mvp-biggest-upset"
+APP_BUILD = "2026-08-19-player-risk-score"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -2667,12 +2667,196 @@ def get_who_knows_ball(cache_key):
 
 
 # ---------------------------------------------------------------------------
+# Player Risk Score — three distinct, real signals blended into one 0-100
+# per-player risk score: durability (real injury-report history — a player
+# like CMC who gets hurt often), boom-bust (week-to-week scoring volatility —
+# a player like Jameson Williams who's either a monster game or a dud), and
+# hype (value run up on perceived opportunity rather than proven production —
+# a player like a low-capital rookie whose price has outpaced what he's
+# actually shown). Each signal is percentile-ranked to 0-100 independently
+# before combining, same reconciliation approach as the external value
+# consensus elsewhere in this file. A player missing a signal (e.g. no
+# tracked injury-report history) is just averaged over whichever signals it
+# does have — not penalized toward 0 for a signal that's simply unknown.
+# ---------------------------------------------------------------------------
+def compute_injury_designation_risk():
+    """Percentile rank of how often a player has appeared on the real NFL
+    injury report as Doubtful/Out (Questionable deliberately excluded — too
+    common/mild on its own; most players get tagged Questionable at some
+    point without missing real time) across nflverse's synced history
+    (injury_reports table, blue_ballers_sync.py). Catches players who play
+    through nagging issues even when they don't miss the game entirely —
+    complements compute_games_missed_risk below, which catches full
+    absences this weekly designation alone misses once a player goes on IR
+    (see that function's docstring). A player absent from this table has no
+    tracked injury-report history at all — simply absent from the returned
+    dict, not assumed durable. `injury_reports` is a brand-new table
+    (blue_ballers_sync.py) — a deployed app whose local DB copy predates
+    that sync's schema migration would hard-crash querying it directly,
+    same gotcha as get_draft_row, so this falls back to an empty dict
+    rather than taking down GM Profiles/Team Pages for however long it
+    takes the next successful sync+refresh to land.
+
+    Percentile pool is restricted to players ever rostered in this league —
+    nflverse tracks every NFL player, including defensive/special-teams
+    players this league never rosters, and their injury-report cadence isn't
+    comparable to offensive skill players'. Confirmed empirically: without
+    this filter, a handful of fringe defensive backs with one real injury
+    designation ranked above actual rostered players just from being
+    percentile-ranked against a much broader, differently-distributed pool."""
+    try:
+        df = load_table(
+            "SELECT sleeper_player_id FROM injury_reports WHERE report_status IN ('Doubtful', 'Out')"
+        )
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    relevant_ids = get_all_ever_rostered_ids()
+    df = df[df["sleeper_player_id"].isin(relevant_ids)]
+    if df.empty:
+        return {}
+    counts = df.groupby("sleeper_player_id").size()
+    return (counts.rank(pct=True) * 100).round(1).to_dict()
+
+
+def compute_games_missed_risk():
+    """Percentile rank of real games missed, detected from snap-count
+    ABSENCE: for each real NFL season, a player missing a snap-count row for
+    a week their own (most common) team otherwise has rows for (i.e. that
+    team played a real game) almost certainly missed that game — IR,
+    inactive, or a healthy scratch, regardless of whether the weekly injury
+    report happened to still be tagging them that week. Confirmed
+    empirically against a real 2024 case: the injury-report tag alone only
+    flagged 2 weeks, but snap-count absence correctly showed 13 of 17
+    missed games for a player who spent most of that season on IR — exactly
+    the gap compute_injury_designation_risk alone can't see, since a player
+    typically drops off the weekly report entirely once on IR. `snap_counts`
+    is a brand-new table — same missing-table fallback as get_draft_row/
+    compute_injury_designation_risk."""
+    try:
+        df = load_table("SELECT season, week, sleeper_player_id, team FROM snap_counts")
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    relevant_ids = get_all_ever_rostered_ids()
+
+    missed = {}
+    for season, season_df in df.groupby("season"):
+        team_weeks = season_df.groupby("team")["week"].apply(set).to_dict()
+        player_weeks = season_df.groupby("sleeper_player_id")["week"].apply(set)
+        player_team = season_df.groupby("sleeper_player_id")["team"].agg(lambda s: s.mode().iloc[0])
+        for pid, weeks_played in player_weeks.items():
+            if pid not in relevant_ids:
+                continue
+            real_weeks = team_weeks.get(player_team[pid], set())
+            count = len(real_weeks - weeks_played)
+            missed[pid] = missed.get(pid, 0) + count
+    if not missed:
+        return {}
+    return (pd.Series(missed).rank(pct=True) * 100).round(1).to_dict()
+
+
+def compute_durability_risk(cache_key):
+    """Combines both real durability signals — games actually missed
+    (compute_games_missed_risk, the more complete signal) and weekly
+    injury-report designations (compute_injury_designation_risk, catches
+    playing-through-it risk games-missed alone wouldn't show) — via simple
+    mean of whichever a player has. `cache_key` isn't used directly (neither
+    sub-signal is itself cached), kept for a consistent call signature with
+    the other two Player Risk Score inputs."""
+    games_missed = compute_games_missed_risk()
+    designations = compute_injury_designation_risk()
+    all_ids = set(games_missed) | set(designations)
+    combined = {}
+    for pid in all_ids:
+        parts = [d[pid] for d in (games_missed, designations) if pid in d]
+        if parts:
+            combined[pid] = round(float(np.mean(parts)), 1)
+    return combined
+
+
+def build_player_score_volatility():
+    """Percentile rank of a player's boom-bust variance: coefficient of
+    variation (std/mean) of real weekly fantasy points, across every week
+    they were actually in a roster's STARTERS list (any roster, any synced
+    season) — isolating real on-field variance from bye/bench weeks, which
+    would otherwise masquerade as "bust" games. Needs >=3 real started weeks
+    to be meaningful; fewer than that has no real variance to measure."""
+    all_seasons = load_table("SELECT league_id, season FROM league_seasons ORDER BY season ASC")
+    points_by_player = {}
+    for _, s in all_seasons.iterrows():
+        lid = s["league_id"]
+        reg_weeks = get_playoff_settings(lid)["regular_season_weeks"]
+        for week in range(1, reg_weeks + 1):
+            df = load_table(
+                "SELECT points, starters, players_points FROM matchups WHERE league_id = ? AND week = ?",
+                params=(lid, week),
+            )
+            if df.empty or df["points"].sum() <= 0:
+                continue
+            for _, row in df.iterrows():
+                starter_ids = [pid for pid in parse_json_field(row["starters"], []) if pid != "0"]
+                points_map = parse_json_field(row["players_points"], {})
+                for pid in starter_ids:
+                    points_by_player.setdefault(pid, []).append(points_map.get(pid, 0.0))
+
+    cv = {}
+    for pid, pts in points_by_player.items():
+        if len(pts) < 3:
+            continue
+        arr = np.array(pts)
+        mean = arr.mean()
+        if mean > 0:
+            cv[pid] = float(arr.std() / mean)
+    if not cv:
+        return {}
+    return (pd.Series(cv).rank(pct=True) * 100).round(1).to_dict()
+
+
+def compute_hype_risk(cache_key):
+    """Percentile rank of the gap between a player's real external-consensus
+    value percentile (compute_consensus_player_values) and their own recent
+    real-production percentile (latest cumulative PPG from
+    build_player_ppg_timeline, the same data Stock Market already uses) — a
+    big positive gap means the market prices this player well above what
+    their own recent production justifies (opportunity/story priced in,
+    results not yet proven). Only meaningful for players with both a
+    tracked value AND real production history; missing either, they're
+    simply absent from the result."""
+    value_pct = compute_consensus_player_values(cache_key)
+    timeline = build_player_ppg_timeline()
+    if not value_pct or timeline.empty:
+        return {}
+    latest_ppg = timeline.sort_values(["season", "week"]).groupby("player_id").tail(1)
+    production_pct = (latest_ppg.set_index("player_id")["cum_ppg"].rank(pct=True) * 100)
+
+    gap = {pid: vpct - production_pct.loc[pid] for pid, vpct in value_pct.items() if pid in production_pct.index}
+    if not gap:
+        return {}
+    return (pd.Series(gap).rank(pct=True) * 100).round(1).to_dict()
+
+
+def compute_player_risk_scores(cache_key):
+    durability = compute_durability_risk(cache_key)
+    volatility = build_player_score_volatility()
+    hype = compute_hype_risk(cache_key)
+    all_ids = set(durability) | set(volatility) | set(hype)
+    scores = {}
+    for pid in all_ids:
+        parts = [d.get(pid) for d in (durability, volatility, hype) if pid in d]
+        if parts:
+            scores[pid] = round(float(np.mean(parts)), 1)
+    return scores
+
+
+# ---------------------------------------------------------------------------
 # GM Profiles — seven ratings per manager, each a 0-100 percentile score
 # among the league's managers, built entirely from data/logic already
 # established elsewhere in this file (Rookie Draft/Trade grading, Team Page
-# metrics, the season simulator's deterministic replay of completed seasons).
-# No injury data exists yet, so Risk Taking is an activity/volatility proxy,
-# not a true risk measure — same caveat as Team Pages/Trade Center.
+# metrics, the season simulator's deterministic replay of completed seasons,
+# and Player Risk Score above for Risk Taking).
 # ---------------------------------------------------------------------------
 GM_RATING_LABELS = ["Drafting", "Trading", "Waivers", "Roster Construction",
                     "Risk Taking", "Player Development", "Clutch"]
@@ -2813,10 +2997,13 @@ def build_gm_profiles(latest_league_id, latest_season_year, cache_key):
             dev_hits[owner] = dev_hits.get(owner, 0) + (1 if net > 0 else 0)
 
     # Roster Construction: current lineup efficiency (starter value share of total roster value).
+    # Risk Taking: average real Player Risk Score (durability + boom-bust + hype, see above)
+    # across every player on the roster.
     latest_standings = get_standings(latest_league_id)
     latest_value_table = get_value_table(latest_league_id, latest_season_year, cache_key)
+    player_risk = compute_player_risk_scores(cache_key)
     roster_construction = {}
-    risk_taking_age = {}
+    risk_raw = {}
     for _, row in latest_standings.iterrows():
         roster_id = int(row["roster_id"])
         owner = row["owner_id"]
@@ -2824,26 +3011,13 @@ def build_gm_profiles(latest_league_id, latest_season_year, cache_key):
         metrics = team_overview_metrics(latest_value_table, player_ids, starter_ids)
         total = metrics["starter_value"] + metrics["bench_value"]
         roster_construction[owner] = metrics["starter_value"] / total if total else 0.5
-        risk_taking_age[owner] = metrics["avg_age"]
-
-    # Risk Taking: transaction frequency (all-time) + how far below the league-average
-    # age their roster sits (younger roster = more boom/bust risk in dynasty terms).
-    activity_counts = {}
-    for _, txn in pd.concat([get_all_trades(cache_key), build_all_waiver_moves()], ignore_index=True).iterrows():
-        for rid in parse_json_field(txn["roster_ids"], []):
-            owner = owner_lookup.get((txn["league_id"], rid))
-            if owner:
-                activity_counts[owner] = activity_counts.get(owner, 0) + 1
+        roster_risks = [player_risk[pid] for pid in player_ids if pid in player_risk]
+        risk_raw[owner] = float(np.mean(roster_risks)) if roster_risks else 50.0
 
     # Neilee is Buddy's co-manager (viewing access only, not a real GM) — exclude her.
     all_owners = sorted(
         owner for owner, name in manager_name_lookup.items() if "neilee" not in name.lower()
     )
-    league_avg_age = np.nanmean(list(risk_taking_age.values())) if risk_taking_age else 27.0
-    risk_raw = {
-        owner: activity_counts.get(owner, 0) * 1.0 + max(0.0, league_avg_age - risk_taking_age.get(owner, league_avg_age)) * 5
-        for owner in all_owners
-    }
 
     # Clutch: sum of playoff-placement points across every fully-completed season —
     # evaluates purely on playoff finish, not regular-season performance at all.
@@ -2891,8 +3065,10 @@ def get_gm_profiles(latest_league_id, latest_season_year, cache_key):
 # ---------------------------------------------------------------------------
 # Hall of Fame / Hall of Shame — career records and single-event superlatives,
 # built by reusing Rookie Draft/Trade grading and the completed-season replay
-# already established above. "Most Injury Luck" is skipped — no injury data
-# is synced yet, same caveat as Risk Taking/Roster Risk elsewhere.
+# already established above. "Most Injury Luck" is still skipped — real
+# injury-report data exists now (see Player Risk Score above), but turning
+# it into a real luck-index metric (actual outcomes vs. injury-adjusted
+# expectation) is a distinct, not-yet-built feature, not a data gap anymore.
 # ---------------------------------------------------------------------------
 def build_regular_season_log():
     """One row per (season, week, roster) played: points, expected win share
@@ -3761,6 +3937,12 @@ def page_team_pages():
     )
     
     st.subheader("Roster")
+    st.caption(
+        "Risk blends three real signals into one 0-100 score: durability (real injury-report "
+        "history), boom-bust (week-to-week scoring volatility), and hype (value that's outpaced "
+        "actual recent production). Higher = riskier."
+    )
+    player_risk = compute_player_risk_scores(synced_at)
     roster_rows = []
     for pid in player_ids:
         info = players_df.loc[pid] if pid in players_df.index else None
@@ -3771,6 +3953,7 @@ def page_team_pages():
             "NFL Team": info["team"] if info is not None else "",
             "Age": value_row["age"] if value_row is not None else None,
             "Value": value_row["value"] if value_row is not None else None,
+            "Risk": player_risk.get(pid),
             "Starter": pid in starter_ids,
         })
     roster_df = pd.DataFrame(roster_rows).sort_values("Starter", ascending=False)
@@ -4191,9 +4374,10 @@ def page_gm_profiles():
     st.caption(
         "Every manager rated 0-100 (percentile among the league's managers) across seven dimensions, "
         "built from the same grading logic as Rookie Draft Center, Trade Center, and Team Pages. "
-        "Risk Taking is an activity/roster-age proxy, not a true risk measure — no injury data is "
-        "synced yet. Clutch is based purely on playoff finish (fully-completed seasons only) — "
-        "regular-season performance doesn't factor in at all."
+        "Risk Taking is each roster's average real Player Risk Score (durability + boom-bust + "
+        "hype — see Team Pages' Roster table for the per-player breakdown). Clutch is based purely "
+        "on playoff finish (fully-completed seasons only) — regular-season performance doesn't "
+        "factor in at all."
     )
     
     gm_profiles = get_gm_profiles(latest_league_id, latest_season_year, synced_at)
@@ -4228,7 +4412,7 @@ def page_hall_of_fame():
     st.caption(
         "Career records and single-event superlatives across every synced season. Best/Worst Draft "
         "Pick and Greatest/Worst Trade reuse the same value grading as Rookie Draft Center and Trade "
-        "Center. Most Injury Luck isn't shown — no injury-status data is synced yet."
+        "Center. Most Injury Luck isn't shown — not yet built as its own metric."
     )
     
     hof = get_hall_of_fame(latest_league_id, latest_season_year, synced_at)
@@ -4482,6 +4666,5 @@ pg.run()
 
 st.divider()
 st.caption(
-    "Not yet built: Risk Rating and Probability of Regret (both need injury-status data, not "
-    "synced yet), and AI-generated League News. These are separate features on the roadmap."
+    "Not yet built: AI-generated League News. On the roadmap, no timeline yet."
 )

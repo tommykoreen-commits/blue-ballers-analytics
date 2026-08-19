@@ -52,6 +52,28 @@ FANTASYCALC_PARAMS = {"isDynasty": "true", "numQbs": 2, "numTeams": 8, "ppr": 1}
 BACKFILL_EXTERNAL_HISTORY = False
 BACKFILL_SINCE = "2024-01-01"
 
+# Real NFL injury-report history (nflverse) — feeds the durability-risk signal.
+# Unlike the value archive, each season's file is already a complete historical
+# snapshot (not a daily diff), so this just re-fetches + upserts every sync,
+# no backfill script needed. A fixed rolling window of REAL NFL seasons,
+# deliberately independent of which seasons this dynasty league has synced --
+# a player's injury history from before this league existed is still real
+# signal (e.g. a chronically-injured veteran).
+SYNC_INJURY_REPORTS = True
+INJURY_SEASONS_BACK = 3
+NFLVERSE_INJURIES_URL = "https://github.com/nflverse/nflverse-data/releases/download/injuries/injuries_{season}.csv"
+
+# Real snap-count presence (nflverse, sourced from Pro Football Reference) --
+# a player who's on a team's roster but has NO snap-count row for a week
+# that team played a real game almost certainly missed that game (IR,
+# inactive, healthy scratch). Confirmed empirically: this catches full
+# season-long IR stints the weekly injury-report tag alone misses, since a
+# player often drops off that report entirely once on IR (no more weekly
+# Doubtful/Out tags) -- e.g. a real 2024 case correctly showed 13 of 17
+# missed games via snap-count absence vs. only 2 tagged weeks via injuries.
+SYNC_SNAP_COUNTS = True
+NFLVERSE_SNAP_COUNTS_URL = "https://github.com/nflverse/nflverse-data/releases/download/snap_counts/snap_counts_{season}.csv"
+
 print("Database will be stored at:", DB_PATH)
 
 engine = create_engine(f"sqlite:///{DB_PATH}")
@@ -217,6 +239,32 @@ class ExternalPickValueSnapshot(Base):
     tier = Column(String, primary_key=True)
     scrape_date = Column(String, primary_key=True)
     raw_value = Column(Float)
+
+
+class InjuryReport(Base):
+    """One real weekly NFL injury-report appearance (nflverse). Only rows
+    with a genuine report_status (Questionable/Doubtful/Out) are stored --
+    a player not appearing at all that week means no injury designation,
+    not "definitely healthy" (nflverse doesn't publish a healthy row)."""
+    __tablename__ = "injury_reports"
+    season = Column(String, primary_key=True)
+    week = Column(Integer, primary_key=True)
+    sleeper_player_id = Column(String, primary_key=True)
+    report_status = Column(String)
+
+
+class SnapCount(Base):
+    """One real weekly snap-count presence row (nflverse, via PFR) -- a
+    player who's absent from this table for a week their own team otherwise
+    has rows for (i.e. that team played a real game) almost certainly missed
+    that game entirely. `team` lets the reader reconstruct "did this
+    player's team play a real game that week" from the table itself, no
+    separate schedule table needed."""
+    __tablename__ = "snap_counts"
+    season = Column(String, primary_key=True)
+    week = Column(Integer, primary_key=True)
+    sleeper_player_id = Column(String, primary_key=True)
+    team = Column(String)
 
 
 Base.metadata.create_all(engine)
@@ -526,19 +574,21 @@ def fetch_fantasycalc_values():
     return resp.json()
 
 
-def crosswalk_to_sleeper(values_df, ids_df):
-    """DynastyProcess join key is fp_id -> db_playerids.fantasypros_id ->
-    sleeper_id. Both null columns MUST be dropped before merging — a left
-    merge on a column containing NaN keys matches every NaN against every
-    other NaN (cartesian blowup), silently producing millions of bogus rows
-    and a near-zero apparent join rate. Confirmed empirically: skipping this
-    drop turned a real ~87% join rate into a false 0% overlap with real
-    Sleeper IDs."""
-    values_valid = values_df.dropna(subset=["fp_id"])
-    ids_valid = ids_df.dropna(subset=["fantasypros_id"])
+def crosswalk_to_sleeper(values_df, ids_df, id_col="fp_id", ids_id_col="fantasypros_id"):
+    """Join key defaults to DynastyProcess's fp_id -> db_playerids.fantasypros_id
+    -> sleeper_id, but any db_playerids.csv ID column works the same way (e.g.
+    id_col="gsis_id", ids_id_col="gsis_id" for nflverse injury data, which uses
+    the same column name on both sides). Both null columns MUST be dropped
+    before merging — a left merge on a column containing NaN keys matches
+    every NaN against every other NaN (cartesian blowup), silently producing
+    millions of bogus rows and a near-zero apparent join rate. Confirmed
+    empirically: skipping this drop turned a real ~87% join rate into a false
+    0% overlap with real Sleeper IDs."""
+    values_valid = values_df.dropna(subset=[id_col])
+    ids_valid = ids_df.dropna(subset=[ids_id_col])
     merged = values_valid.merge(
-        ids_valid[["fantasypros_id", "sleeper_id"]],
-        left_on="fp_id", right_on="fantasypros_id", how="left",
+        ids_valid[[ids_id_col, "sleeper_id"]],
+        left_on=id_col, right_on=ids_id_col, how="left",
     ).dropna(subset=["sleeper_id"])
     merged["sleeper_id"] = merged["sleeper_id"].astype(int).astype(str)
     return merged
@@ -604,6 +654,62 @@ def sync_external_pick_values(session, scrape_date_today):
         ))
         count += 1
     return count
+
+
+# ---------------------------------------------------------------------------
+# Real NFL injury-report history (nflverse) — feeds the durability-risk
+# signal. Each season's file is already a complete historical snapshot to
+# date, so there's no separate backfill step like the value archive needed --
+# just re-fetch + upsert a rolling window of real NFL seasons every sync.
+# ---------------------------------------------------------------------------
+def fetch_nfl_injury_reports(season):
+    return pd.read_csv(NFLVERSE_INJURIES_URL.format(season=season))
+
+
+def sync_injury_reports(session, dp_ids):
+    current_year = datetime.now(timezone.utc).year
+    total = 0
+    for season in range(current_year - INJURY_SEASONS_BACK, current_year + 1):
+        try:
+            df = fetch_nfl_injury_reports(season)
+        except Exception as e:
+            print(f"  no injury data for {season} yet, skipping ({e})")
+            continue
+        reported = df.dropna(subset=["report_status"])
+        matched = crosswalk_to_sleeper(reported, dp_ids, id_col="gsis_id", ids_id_col="gsis_id")
+        for _, row in matched.iterrows():
+            session.merge(InjuryReport(
+                season=str(row["season"]), week=int(row["week"]),
+                sleeper_player_id=row["sleeper_id"], report_status=row["report_status"],
+            ))
+            total += 1
+    return total
+
+
+def fetch_nfl_snap_counts(season):
+    return pd.read_csv(NFLVERSE_SNAP_COUNTS_URL.format(season=season))
+
+
+def sync_snap_counts(session, dp_ids):
+    """Every player's weekly snap-count presence (not just injured players --
+    absence itself is the signal here, so every real row matters, unlike
+    injury_reports which only keeps rows with a genuine designation)."""
+    current_year = datetime.now(timezone.utc).year
+    total = 0
+    for season in range(current_year - INJURY_SEASONS_BACK, current_year + 1):
+        try:
+            df = fetch_nfl_snap_counts(season)
+        except Exception as e:
+            print(f"  no snap count data for {season} yet, skipping ({e})")
+            continue
+        matched = crosswalk_to_sleeper(df, dp_ids, id_col="pfr_player_id", ids_id_col="pfr_id")
+        for _, row in matched.iterrows():
+            session.merge(SnapCount(
+                season=str(row["season"]), week=int(row["week"]),
+                sleeper_player_id=row["sleeper_id"], team=row["team"],
+            ))
+            total += 1
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +886,38 @@ if SYNC_EXTERNAL_VALUES:
 else:
     print("Skipping external valuation sync (SYNC_EXTERNAL_VALUES=False)")
 
+if SYNC_INJURY_REPORTS:
+    print("\nSyncing real NFL injury-report history (nflverse)...")
+    session = SessionLocal()
+    try:
+        dp_ids = fetch_dynastyprocess_ids()
+        injury_rows = sync_injury_reports(session, dp_ids)
+        session.commit()
+        print(f"  injury report rows: {injury_rows}")
+    except Exception as e:
+        session.rollback()
+        print(f"  WARNING: injury report sync failed, skipping ({e}) — everything else above is unaffected")
+    finally:
+        session.close()
+else:
+    print("Skipping injury report sync (SYNC_INJURY_REPORTS=False)")
+
+if SYNC_SNAP_COUNTS:
+    print("\nSyncing real NFL snap-count history (nflverse)...")
+    session = SessionLocal()
+    try:
+        dp_ids = fetch_dynastyprocess_ids()
+        snap_rows = sync_snap_counts(session, dp_ids)
+        session.commit()
+        print(f"  snap count rows: {snap_rows}")
+    except Exception as e:
+        session.rollback()
+        print(f"  WARNING: snap count sync failed, skipping ({e}) — everything else above is unaffected")
+    finally:
+        session.close()
+else:
+    print("Skipping snap count sync (SYNC_SNAP_COUNTS=False)")
+
 if BACKFILL_EXTERNAL_HISTORY:
     print(f"\nRunning ONE-TIME DynastyProcess historical backfill since {BACKFILL_SINCE}...")
     session = SessionLocal()
@@ -795,7 +933,8 @@ if BACKFILL_EXTERNAL_HISTORY:
 with engine.connect() as conn:
     for table in ["league_seasons", "managers", "roster_team_names", "rosters",
                   "matchups", "transactions", "drafts", "draft_picks", "traded_picks", "players",
-                  "external_player_value_snapshots", "external_pick_value_snapshots"]:
+                  "external_player_value_snapshots", "external_pick_value_snapshots", "injury_reports",
+                  "snap_counts"]:
         count = conn.exec_driver_sql(f"SELECT COUNT(*) FROM {table}").scalar()
         print(f"{table:20s} {count}")
 
