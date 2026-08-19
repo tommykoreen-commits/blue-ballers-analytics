@@ -43,7 +43,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-18-external-value-consensus"
+APP_BUILD = "2026-08-19-gdown-fuzzy-arg-fix"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -58,7 +58,7 @@ def download_db():
     import gdown
     for attempt in range(2):
         try:
-            gdown.download(id=st.secrets["drive_file_id"], output=DB_PATH, quiet=True, fuzzy=True)
+            gdown.download(id=st.secrets["drive_file_id"], output=DB_PATH, quiet=True)
             return True
         except Exception as e:
             last_error = e
