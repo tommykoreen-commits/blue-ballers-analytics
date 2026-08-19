@@ -42,7 +42,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-19-player-risk-score"
+APP_BUILD = "2026-08-19-most-injury-luck"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -3065,10 +3065,9 @@ def get_gm_profiles(latest_league_id, latest_season_year, cache_key):
 # ---------------------------------------------------------------------------
 # Hall of Fame / Hall of Shame — career records and single-event superlatives,
 # built by reusing Rookie Draft/Trade grading and the completed-season replay
-# already established above. "Most Injury Luck" is still skipped — real
-# injury-report data exists now (see Player Risk Score above), but turning
-# it into a real luck-index metric (actual outcomes vs. injury-adjusted
-# expectation) is a distinct, not-yet-built feature, not a data gap anymore.
+# already established above. "Most Injury Luck" (compute_injury_burden below)
+# uses real nflverse snap-count data (see Player Risk Score above) — real
+# fantasy points lost to real missed games across a roster's whole history.
 # ---------------------------------------------------------------------------
 def build_regular_season_log():
     """One row per (season, week, roster) played: points, expected win share
@@ -3144,6 +3143,53 @@ def compute_luck_index(game_log):
     ).reset_index()
     luck["luck_index"] = luck["actual_wins"] - luck["expected_wins"]
     return luck
+
+
+def compute_injury_burden():
+    """Per-(season, owner) real fantasy points 'lost' to missed games — for
+    every player ever on a manager's roster that season, real games missed
+    (snap-count absence, same signal as compute_games_missed_risk) times
+    that player's own real PPG that season (their own best available
+    estimate of what they'd have scored had they played), summed across
+    the whole roster. Bounded to this league's real regular season
+    (reg_weeks) — the games that actually decided standings, same scope as
+    Luck Index. `snap_counts` is a new table — same missing-table fallback
+    as get_draft_row/compute_games_missed_risk."""
+    try:
+        snaps = load_table("SELECT season, week, sleeper_player_id, team FROM snap_counts")
+    except Exception:
+        return pd.DataFrame(columns=["season", "owner_id", "injury_burden"])
+    if snaps.empty:
+        return pd.DataFrame(columns=["season", "owner_id", "injury_burden"])
+
+    ppg_timeline = build_player_ppg_timeline()
+    final_ppg = ppg_timeline.sort_values(["season", "week"]).groupby(["season", "player_id"]).tail(1)
+    ppg_lookup = {(row["season"], row["player_id"]): row["cum_ppg"] for _, row in final_ppg.iterrows()}
+
+    all_seasons = load_table("SELECT league_id, season FROM league_seasons ORDER BY season ASC")
+    rows = []
+    for _, s in all_seasons.iterrows():
+        lid, season = s["league_id"], s["season"]
+        reg_weeks = get_playoff_settings(lid)["regular_season_weeks"]
+        season_snaps = snaps[(snaps["season"] == season) & (snaps["week"] <= reg_weeks)]
+        if season_snaps.empty:
+            continue
+        team_weeks = season_snaps.groupby("team")["week"].apply(set).to_dict()
+        player_weeks = season_snaps.groupby("sleeper_player_id")["week"].apply(set)
+        player_team = season_snaps.groupby("sleeper_player_id")["team"].agg(lambda x: x.mode().iloc[0])
+
+        rosters_df = load_table("SELECT owner_id, players FROM rosters WHERE league_id = ?", params=(lid,))
+        for _, roster_row in rosters_df.iterrows():
+            owner = roster_row["owner_id"]
+            burden = 0.0
+            for pid in parse_json_field(roster_row["players"], []):
+                if pid not in player_team.index:
+                    continue
+                real_weeks = team_weeks.get(player_team[pid], set())
+                missed = len(real_weeks - player_weeks.get(pid, set()))
+                burden += missed * ppg_lookup.get((season, pid), 0.0)
+            rows.append({"season": season, "owner_id": owner, "injury_burden": round(burden, 1)})
+    return pd.DataFrame(rows)
 
 
 PLAYOFF_WINS_BY_PLACEMENT = {"champion": 2, "runner_up": 1, "third": 1, "fourth": 0, "missed_playoffs": 0}
@@ -3255,6 +3301,9 @@ def build_hall_of_fame(latest_league_id, latest_season_year, cache_key):
     game_log = get_regular_season_log(cache_key)
     streaks = compute_streaks(game_log)
     luck = compute_luck_index(game_log)
+    injury_burden = compute_injury_burden()
+    career_burden = (injury_burden.groupby("owner_id")["injury_burden"].sum().reset_index()
+                      if not injury_burden.empty else pd.DataFrame(columns=["owner_id", "injury_burden"]))
 
     champions, runner_ups, playoff_wins, _finals_appearances, _playoff_appearances, choke_candidates = \
         compute_playoff_records()
@@ -3276,12 +3325,15 @@ def build_hall_of_fame(latest_league_id, latest_season_year, cache_key):
     leaderboard["runner_ups"] = leaderboard["owner_id"].map(runner_ups).fillna(0).astype(int)
     leaderboard["playoff_wins"] = leaderboard["owner_id"].map(playoff_wins).fillna(0).astype(int)
     leaderboard = leaderboard.merge(streaks, on="owner_id", how="left").merge(luck, on="owner_id", how="left")
+    leaderboard = leaderboard.merge(career_burden, on="owner_id", how="left")
     leaderboard = leaderboard.sort_values("career_wins", ascending=False)
 
     biggest_choke = max(choke_candidates, key=lambda c: c["choke_score"]) if choke_candidates else None
     if biggest_choke:
         biggest_choke = {**biggest_choke, "manager": manager_name(biggest_choke["owner_id"])}
     most_unlucky = leaderboard.loc[leaderboard["luck_index"].idxmin()] if not leaderboard.empty else None
+    most_injury_luck = (leaderboard.loc[leaderboard["injury_burden"].idxmax()]
+                         if not leaderboard.empty and leaderboard["injury_burden"].notna().any() else None)
 
     # NOTE: don't put closures (e.g. `manager_name`) in this dict — st.cache_data pickles
     # the return value, and Python can't pickle local closures. Resolve names above instead.
@@ -3296,6 +3348,7 @@ def build_hall_of_fame(latest_league_id, latest_season_year, cache_key):
         "best_pick": best_pick, "worst_pick": worst_pick, "best_draft_team": best_draft_team,
         "greatest_trade": greatest_trade, "worst_trade": worst_trade,
         "biggest_choke": biggest_choke, "most_unlucky": most_unlucky,
+        "most_injury_luck": most_injury_luck,
     }
 
 
@@ -4412,7 +4465,8 @@ def page_hall_of_fame():
     st.caption(
         "Career records and single-event superlatives across every synced season. Best/Worst Draft "
         "Pick and Greatest/Worst Trade reuse the same value grading as Rookie Draft Center and Trade "
-        "Center. Most Injury Luck isn't shown — not yet built as its own metric."
+        "Center. Most Injury Luck is real fantasy points lost to real missed games (nflverse "
+        "snap-count data) across a manager's whole roster history, not a general win/loss luck measure."
     )
     
     hof = get_hall_of_fame(latest_league_id, latest_season_year, synced_at)
@@ -4491,6 +4545,11 @@ def page_hall_of_fame():
             mu = hof["most_unlucky"]
             metric_block(st, "Most Unlucky Team", mu["manager"],
                          f"{mu['luck_index']:.1f} wins below expected (career)")
+
+        if hof["most_injury_luck"] is not None:
+            mil = hof["most_injury_luck"]
+            metric_block(st, "Most Injury Luck", mil["manager"],
+                         f"{mil['injury_burden']:.0f} pts lost to real missed games (career)")
 
 def page_league_records():
     st.header("League Records")
