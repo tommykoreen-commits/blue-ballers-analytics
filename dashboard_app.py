@@ -42,7 +42,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-19-draft-timestamp-migration-fix"
+APP_BUILD = "2026-08-19-weekly-mvp-biggest-upset"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -622,26 +622,6 @@ def get_week_matchups(league_id, week):
     return load_table(query, params=(league_id, week))
 
 
-def get_week_top_performer(league_id, week, players_df):
-    """Highest individual player score across the whole league for one week."""
-    df = load_table(
-        "SELECT roster_id, players_points FROM matchups WHERE league_id = ? AND week = ?",
-        params=(league_id, week),
-    )
-    best = None
-    for _, row in df.iterrows():
-        pts_map = parse_json_field(row["players_points"], {})
-        for pid, pts in pts_map.items():
-            if best is None or pts > best["points"]:
-                info = players_df.loc[pid] if pid in players_df.index else None
-                best = {
-                    "player": info["full_name"] if info is not None else pid,
-                    "position": info["position"] if info is not None else "",
-                    "points": pts,
-                }
-    return best
-
-
 POSITION_LABELS = {"QB": "quarterback", "RB": "running back", "WR": "wide receiver",
                     "TE": "tight end", "DEF": "defense", "K": "kicker"}
 
@@ -664,6 +644,36 @@ def compute_week_positional_averages(league_id, week, players_df):
             totals[pos] = totals.get(pos, 0.0) + points_map.get(pid, 0.0)
             counts[pos] = counts.get(pos, 0) + 1
     return {pos: totals[pos] / counts[pos] for pos in totals if counts.get(pos)}
+
+
+def get_week_mvp(league_id, week, players_df):
+    """Best individual performance league-wide for one week: the STARTER (not
+    bench — same real-lineup-only rule compute_week_positional_averages uses)
+    whose points beat their own position's average that week by the most,
+    across every roster in the league — not just within one matchup, unlike
+    build_matchup_recap's per-team version of this same idea. Replaces the
+    old get_week_top_performer, which compared raw points with no positional
+    context and included bench players, so a garbage-time backup kicker
+    could out-rank a real standout starter."""
+    pos_avg = compute_week_positional_averages(league_id, week, players_df)
+    df = load_table(
+        "SELECT starters, players_points FROM matchups WHERE league_id = ? AND week = ?",
+        params=(league_id, week),
+    )
+    best = None
+    for _, row in df.iterrows():
+        starter_ids = [pid for pid in parse_json_field(row["starters"], []) if pid != "0"]
+        points_map = parse_json_field(row["players_points"], {})
+        for pid in starter_ids:
+            info = players_df.loc[pid] if pid in players_df.index else None
+            pos = info["position"] if info is not None else None
+            if not pos:
+                continue
+            pts = points_map.get(pid, 0.0)
+            margin = pts - pos_avg.get(pos, pts)
+            if best is None or margin > best["margin"]:
+                best = {"player": info["full_name"], "position": pos, "points": pts, "margin": margin}
+    return best
 
 
 def describe_matchup(team_a, points_a, team_b, points_b):
@@ -891,10 +901,15 @@ def estimate_team_distributions(league_id, standings, through_week=None):
     directly, which produces unstable, inconsistently-scaled variance
     estimates team-to-team early in the season.
     `through_week` caps the window, e.g. to reconstruct last week's power
-    rankings for a week-over-week movement indicator."""
+    rankings for a week-over-week movement indicator. Checked against
+    `is not None`, not plain truthiness — through_week=0 (a real, meaningful
+    value meaning "before week 1 has happened, use only the prior-season
+    baseline") is falsy in Python, and a naive `if through_week` would treat
+    it as "no cap" and leak the entire season into what's supposed to be a
+    pre-week-1 estimate."""
     prev_league_id = get_previous_league_id(league_id)
-    week_filter = " AND week <= ?" if through_week else ""
-    week_params = (through_week,) if through_week else ()
+    week_filter = " AND week <= ?" if through_week is not None else ""
+    week_params = (through_week,) if through_week is not None else ()
     league_scores = load_table(
         f"SELECT points FROM matchups WHERE league_id = ? AND points > 0{week_filter}",
         params=(league_id, *week_params),
@@ -1233,6 +1248,63 @@ def simulate_odds(league_id, cache_key, n_trials=N_TRIALS):
     standings_local = get_standings(league_id)
     distributions = estimate_team_distributions(league_id, standings_local)
     return run_simulation(league_id, standings_local, distributions, n_trials)
+
+
+UPSET_TRIALS = 2000  # per-matchup Monte Carlo sample size for a pre-game win probability —
+# cheap (a single vectorized Gamma draw), so no need for N_TRIALS-scale precision here
+
+
+def build_upset_history(cache_key):
+    """Every completed regular-season matchup ever synced, with the actual
+    winner's REAL pre-game win probability — not a post-hoc "how close was
+    it" number, but what the season simulator's own distribution/sampling
+    machinery would have predicted strictly BEFORE that week happened
+    (estimate_team_distributions(..., through_week=week-1) + sample_weekly_
+    scores, the exact same building blocks run_simulation uses to project
+    undecided weeks, just pointed at an already-decided one). A team that
+    wins with a low winner_pregame_prob was a real underdog that day."""
+    all_seasons = load_table("SELECT league_id, season FROM league_seasons ORDER BY season ASC")
+    global_team_lookup = get_global_team_lookup()
+    rng = np.random.default_rng()
+
+    rows = []
+    for _, s in all_seasons.iterrows():
+        lid, season = s["league_id"], s["season"]
+        standings_local = get_standings(lid)
+        reg_weeks = get_playoff_settings(lid)["regular_season_weeks"]
+        schedule = get_full_schedule(lid, max_week=reg_weeks)
+        roster_ids = [int(r) for r in standings_local["roster_id"]]
+
+        for week in range(1, reg_weeks + 1):
+            actual = compute_actual_week_scores(schedule, roster_ids, week)
+            if not actual:
+                continue
+            distributions = estimate_team_distributions(lid, standings_local, through_week=week - 1)
+            for _, pair in get_week_pairings(schedule, week).items():
+                if len(pair) != 2:
+                    continue
+                a, b = int(pair[0]), int(pair[1])
+                mean_a, std_a = distributions.get(a, (100.0, 25.0))
+                mean_b, std_b = distributions.get(b, (100.0, 25.0))
+                samples_a = sample_weekly_scores(rng, np.array([mean_a]), np.array([std_a]), size=(UPSET_TRIALS, 1))
+                samples_b = sample_weekly_scores(rng, np.array([mean_b]), np.array([std_b]), size=(UPSET_TRIALS, 1))
+                prob_a = float(np.mean(samples_a > samples_b))
+
+                winner, loser = (a, b) if actual[a] > actual[b] else (b, a)
+                winner_prob = prob_a if winner == a else (1 - prob_a)
+                rows.append({
+                    "season": season, "week": week,
+                    "winner": global_team_lookup.get((lid, winner), f"Roster {winner}"),
+                    "loser": global_team_lookup.get((lid, loser), f"Roster {loser}"),
+                    "winner_pregame_prob": round(winner_prob, 3),
+                    "winner_score": actual[winner], "loser_score": actual[loser],
+                })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=1800)
+def get_upset_history(cache_key):
+    return build_upset_history(cache_key)
 
 
 # ---------------------------------------------------------------------------
@@ -3474,6 +3546,14 @@ def page_home():
     
     st.header("Weekly Recap")
     last_week = get_last_completed_week(league_id)
+    # Capped at this league's real final week (the same round2_weeks[1] leakage guard used
+    # elsewhere, e.g. Hall of Fame's weekly-score records) -- get_last_completed_week itself
+    # isn't changed since 5 other call sites rely on its current behavior, but real (if smaller)
+    # NFL week-18 scoring leaks into matchups even though this league's fantasy season ends at
+    # week 17, and offering "Week 18" here would show a bogus MVP/Upset for a week that isn't
+    # real for this league.
+    if last_week is not None:
+        last_week = min(last_week, get_playoff_settings(league_id)["round2_weeks"][1])
     if last_week is None:
         st.info("No completed weeks yet this season.")
     else:
@@ -3483,8 +3563,16 @@ def page_home():
         if not week_matchups.empty:
             highest = week_matchups.loc[week_matchups["points"].idxmax()]
             lowest = week_matchups.loc[week_matchups["points"].idxmin()]
-            top_performer = get_week_top_performer(league_id, week_choice, players_df)
-    
+            week_mvp = get_week_mvp(league_id, week_choice, players_df)
+
+            upset_history = get_upset_history(synced_at)
+            week_upsets = upset_history[(upset_history["season"] == season_choice) &
+                                         (upset_history["week"] == week_choice)]
+            biggest_upset = (week_upsets.loc[week_upsets["winner_pregame_prob"].idxmin()]
+                              if not week_upsets.empty else None)
+            if biggest_upset is not None and biggest_upset["winner_pregame_prob"] >= 0.5:
+                biggest_upset = None  # nobody was actually the underdog this week -- not a real upset
+
             two_team_games = []
             for _, group in week_matchups.groupby("matchup_id"):
                 if len(group) == 2:
@@ -3492,18 +3580,21 @@ def page_home():
                     two_team_games.append({"a": a, "b": b, "margin": abs(a["points"] - b["points"])})
             closest_game = min(two_team_games, key=lambda g: g["margin"]) if two_team_games else None
             biggest_blowout = max(two_team_games, key=lambda g: g["margin"]) if two_team_games else None
-    
+
             st.subheader(f"Week {week_choice} Headlines")
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             metric_block(c1, "Top Score", highest["team_name"], f"{highest['points']:.1f} pts")
             metric_block(c2, "Lowest Score", lowest["team_name"], f"{lowest['points']:.1f} pts")
             if closest_game:
                 metric_block(c3, "Closest Game",
                              f"{closest_game['a']['team_name']} vs {closest_game['b']['team_name']}",
                              f"{closest_game['margin']:.1f} pt margin")
-            if top_performer:
-                metric_block(c4, "Top Performer", f"{top_performer['player']} ({top_performer['position']})",
-                             f"{top_performer['points']:.1f} pts")
+            if week_mvp:
+                metric_block(c4, "Weekly MVP", f"{week_mvp['player']} ({week_mvp['position']})",
+                             f"+{week_mvp['margin']:.1f} vs. position avg")
+            if biggest_upset is not None:
+                metric_block(c5, "Biggest Upset", f"{biggest_upset['winner']} over {biggest_upset['loser']}",
+                             f"{biggest_upset['winner_pregame_prob']:.0%} pre-game win chance")
     
             st.subheader("Matchup Recaps")
             for _, group in week_matchups.groupby("matchup_id"):
@@ -4391,7 +4482,6 @@ pg.run()
 
 st.divider()
 st.caption(
-    "Not yet built: Weekly MVP and Biggest Upset (needs a win-probability model), Risk Rating "
-    "and Probability of Regret (both need injury-status data, not synced yet), and "
-    "AI-generated League News. These are separate features on the roadmap."
+    "Not yet built: Risk Rating and Probability of Regret (both need injury-status data, not "
+    "synced yet), and AI-generated League News. These are separate features on the roadmap."
 )
