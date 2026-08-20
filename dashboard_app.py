@@ -21,6 +21,45 @@ import streamlit as st
 N_TRIALS = 10000
 SHRINKAGE_GAMES = 4  # weight given to a team's own results vs. its prior-season baseline
 RECENCY_DECAY = 0.9  # per-week decay on how much a past week counts toward "current form"
+MAX_WEEKS_PER_SEASON = 18  # NFL's real week range (regular season + postseason). Folds a
+# (season-rank, week) pair into one continuous integer sequence across season boundaries, so
+# a player's recency decay doesn't reset to "week 1 = most recent" every time a new league_id
+# (new season) starts. Doesn't need to be exact -- just >= any real week number that appears
+# in matchups.week.
+PLAYER_SHRINK_GAMES = 8  # per-PLAYER analogue of SHRINKAGE_GAMES: how hard a small real-game
+# sample is pulled toward that position's median. Without it a backup who happened to be
+# rostered during one hot 9-game stretch (real case: Jacoby Brissett, 19.0 PPG over 9 games,
+# no byes) outranks a genuine star with a longer, more representative record.
+MARKET_BLEND = 0.5  # how much of a player's projected strength comes from real external
+# dynasty-market consensus vs. his own real in-league production. Production alone
+# systematically misreads players whose recent real weeks were byes/injuries/bench time, and
+# can't see talent a player hasn't had the chance to show yet; market consensus alone ignores
+# how a player is actually producing right now. An even split scored closest to a real
+# human read of the league (verified against tommy's own gut ranking of all 8 teams).
+BYE_WEEK_SHARE = 1 / 17  # every NFL team sits out one week a season — real unavailability a
+# "best 12 players" sum silently ignores. Simulated per NFL TEAM, not per player, because a
+# bye takes every player on that team out the same week; that clustering is exactly what
+# punishes a roster stacked with several starters from the same NFL team.
+MAX_INJURY_RATE = 0.5  # cap on a single player's modeled injury miss rate, so someone coming
+# off a lost season isn't projected as more absent than present.
+BASE_RATE_MIN_GAMES = 8  # a player needs this many real games played before he counts toward
+# his position's BASE injury rate. Every NFL position carries a long tail of fringe players who
+# are inactive most weeks; pooling them in put the "normal" rate for a QB over 50%, which is
+# nonsense for anyone who actually starts, and would have handed every unproven rookie that
+# same inflated risk.
+INJURY_SHRINK_GAMES = 24  # ~1.5 real seasons' worth of pull toward the positional base rate.
+# A clean injury record is NOT evidence of zero future risk -- every RB carries real risk
+# whatever his history, and taking observed rates at face value handed genuine workhorses a
+# 0% chance of ever sitting, which quietly erased the cost of a thin bench behind them.
+DEPTH_SIM_WEEKS = 150  # simulated weeks per team for the depth model. Enough to price
+# multi-absence weeks (the case that actually separates a deep roster from a top-heavy one)
+# without a meaningful hit to page load.
+DEPTH_SIM_SEED = 20260820  # fixed so rankings don't wobble between identical page loads.
+PROJECTION_UNCERTAINTY = 16.0  # points/week of honest doubt about a roster projection itself,
+# applied only in proportion to how little of THIS season has actually been played. Projecting
+# a roster that has never taken the field is a genuinely uncertain estimate, and treating it as
+# exact truth made the preseason favorite look far more inevitable than any real projection
+# should. Fades to nothing as real results accumulate and the estimate stops being a guess.
 
 # Live/current player and pick values come from real external market consensus
 # (DynastyProcess + FantasyCalc — see compute_consensus_player_values/compute_consensus_pick_value
@@ -42,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-19-most-injury-luck"
+APP_BUILD = "2026-08-20-league-news-and-roster-projection"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -676,6 +715,23 @@ def get_week_mvp(league_id, week, players_df):
     return best
 
 
+def get_league_news(league_id, week):
+    """Cached AI-generated weekly recap, written once by blue_ballers_sync.py
+    at sync time -- this only ever reads a pre-written row, never calls
+    Gemini itself. Bare try/except like get_draft_row/compute_games_missed_risk:
+    the league_news table won't exist on the live Drive DB until tommy's next
+    real Colab sync creates it, so a stale deployed app must degrade to
+    "nothing to show" instead of crashing the Home page."""
+    try:
+        df = load_table(
+            "SELECT article FROM league_news WHERE league_id = ? AND week = ?",
+            params=(league_id, week),
+        )
+    except Exception:
+        return None
+    return df.iloc[0]["article"] if not df.empty else None
+
+
 def describe_matchup(team_a, points_a, team_b, points_b):
     winner, winner_pts = (team_a, points_a) if points_a > points_b else (team_b, points_b)
     loser, loser_pts = (team_b, points_b) if points_a > points_b else (team_a, points_a)
@@ -890,23 +946,266 @@ def get_owner_scores(league_id, owner_id):
     return load_table(query, params=(league_id, owner_id))["points"].tolist()
 
 
-def estimate_team_distributions(league_id, standings, through_week=None):
+def _season_chain_up_to(league_id):
+    """All league_ids in this dynasty's lineage from oldest to `league_id` itself, walking
+    the previous_league_id chain all the way back instead of just one hop -- a player's real
+    production from two seasons ago is still real signal for build_player_form_index below."""
+    chain = [league_id]
+    cur = league_id
+    while True:
+        prev = get_previous_league_id(cur)
+        if not prev:
+            break
+        chain.append(prev)
+        cur = prev
+    return list(reversed(chain))  # oldest -> newest; league_id is always chain[-1]
+
+
+def build_player_form_index(league_id, through_week=None):
+    """Per-player real recent production: {player_id: (recency_weighted_ppg, games_played)}
+    across all synced seasons through `league_id`/`through_week`. Feeds
+    project_roster_distribution's roster-based prior below.
+
+    Counts ONLY weeks the player actually scored (points > 0). A 0.0 entry in
+    players_points overwhelmingly means "didn't play" -- bye week, inactive, IR, or a week
+    that hasn't happened yet -- not "played and was shut out", and averaging those in
+    silently guts real starters (real case: Trevor Lawrence's last 9 recorded weeks are all
+    0.0 while he was on IR, dragging a genuine 18.4 PPG starter down to 13.8). The
+    tradeoff -- a true 0-point game by a healthy starter is dropped too -- is far smaller
+    than the distortion it prevents, since real 0-point starts are rare and bye/IR zeros are
+    not. `games_played` is returned alongside so callers can shrink small samples
+    (PLAYER_SHRINK_GAMES).
+
+    Reuses RECENCY_DECAY exactly the way estimate_team_distributions' own own_mean does
+    (weight = RECENCY_DECAY ** weeks_ago), extended across season boundaries via
+    MAX_WEEKS_PER_SEASON so production isn't judged against a decay clock that resets every
+    year. `weeks_ago` is measured against the cutoff itself, not each player's own last game
+    -- someone who hasn't played in weeks should read as stale relative to right now.
+
+    One query total, independent of player/team count -- safe to call once per
+    estimate_team_distributions() invocation even though build_upset_history calls that once
+    per historical (season, week)."""
+    chain = _season_chain_up_to(league_id)
+    league_rank = {lid: i for i, lid in enumerate(chain)}
+
+    placeholders = ",".join("?" * len(chain))
+    query = f"SELECT league_id, week, players_points FROM matchups WHERE league_id IN ({placeholders}) AND points > 0"
+    params = list(chain)
+    if through_week is not None:
+        query += " AND NOT (league_id = ? AND week > ?)"
+        params += [league_id, through_week]
+    rows = load_table(query, params=tuple(params))
+
+    records = []
+    for _, r in rows.iterrows():
+        pts_map = parse_json_field(r["players_points"], {})
+        if not pts_map:
+            continue
+        seq = league_rank[r["league_id"]] * MAX_WEEKS_PER_SEASON + int(r["week"])
+        for pid, pts in pts_map.items():
+            if pts > 0:
+                records.append((pid, float(pts), seq))
+    if not records:
+        return {}
+
+    flat = pd.DataFrame(records, columns=["player_id", "points", "seq"])
+    cutoff_seq = (league_rank[league_id] * MAX_WEEKS_PER_SEASON + through_week
+                  if through_week is not None else int(flat["seq"].max()))
+    flat["weight"] = RECENCY_DECAY ** (cutoff_seq - flat["seq"]).clip(lower=0)
+    flat["weighted_pts"] = flat["points"] * flat["weight"]
+    agg = flat.groupby("player_id").agg(
+        weighted_pts=("weighted_pts", "sum"), weight=("weight", "sum"), games=("points", "size"))
+    return {pid: (row["weighted_pts"] / row["weight"], int(row["games"]))
+            for pid, row in agg.iterrows()}
+
+
+def compute_position_baselines(player_form, players_df):
+    """Per-position (median, replacement_floor) of real per-game production among players who
+    DO have history. The median is the shrinkage target for players with a thin real sample
+    (PLAYER_SHRINK_GAMES); the floor -- bottom quartile -- is the value used for players with
+    NO synced history at all (true rookies from this year's draft). The floor is deliberately
+    not 0.0 (most rookies who make an active dynasty roster are usable, not truly
+    replacement-level) and deliberately not the position average (that would credit a total
+    unknown with league-average production). Both self-calibrate to this league's real
+    scoring settings instead of hand-picked constants needing re-tuning every year."""
+    by_pos = {}
+    for pid, (ppg, _games) in player_form.items():
+        pos = players_df.loc[pid, "position"] if pid in players_df.index else None
+        if pos:
+            by_pos.setdefault(pos, []).append(ppg)
+    medians = {pos: float(np.median(vals)) for pos, vals in by_pos.items() if vals}
+    floors = {pos: float(np.percentile(vals, 25)) for pos, vals in by_pos.items() if vals}
+    all_vals = [v for vals in by_pos.values() for v in vals]
+    medians["_overall"] = float(np.median(all_vals)) if all_vals else 0.0
+    floors["_overall"] = float(np.percentile(all_vals, 25)) if all_vals else 0.0
+    return medians, floors
+
+
+def build_player_injury_rate(players_df):
+    """Per-player probability of missing a given game, plus the per-POSITION base rate to fall
+    back on. Built from snap-count ABSENCE — the same signal compute_games_missed_risk uses,
+    but the raw RATE here rather than a percentile rank, since depth math needs a real
+    probability. Byes are NOT included (a bye leaves no snap-count rows for the whole team, so
+    those weeks aren't in the denominator either); compute_depth_adjusted_distribution
+    simulates them separately, per NFL team.
+
+    Each player's observed rate is shrunk toward his position's real base rate by
+    INJURY_SHRINK_GAMES, and a player with no history at all (true rookie) gets that base rate
+    outright. Taking observed rates at face value is the trap here: a genuine workhorse who
+    happens not to have missed a game reads as 0% risk forever, which makes a thin bench behind
+    him look free. Positions differ enough in real risk (a RB is not a QB) that one league-wide
+    base rate would be worse than a per-position one.
+
+    `snap_counts` is a newer table — same missing-table fallback as get_draft_row/
+    compute_games_missed_risk (an empty result leaves the depth model with byes only)."""
+    try:
+        df = load_table("SELECT season, week, sleeper_player_id, team FROM snap_counts")
+    except Exception:
+        return {}, {}
+    if df.empty:
+        return {}, {}
+
+    missed, played = {}, {}
+    for _season, season_df in df.groupby("season"):
+        team_weeks = season_df.groupby("team")["week"].apply(set).to_dict()
+        player_weeks = season_df.groupby("sleeper_player_id")["week"].apply(set)
+        player_team = season_df.groupby("sleeper_player_id")["team"].agg(lambda s: s.mode().iloc[0])
+        for pid, weeks_played in player_weeks.items():
+            real_weeks = team_weeks.get(player_team[pid], set())
+            missed[pid] = missed.get(pid, 0) + len(real_weeks - weeks_played)
+            played[pid] = played.get(pid, 0) + len(weeks_played)
+
+    pos_missed, pos_total = {}, {}
+    for pid, miss in missed.items():
+        pos = players_df.loc[pid, "position"] if pid in players_df.index else None
+        if not pos or played.get(pid, 0) < BASE_RATE_MIN_GAMES:
+            continue
+        pos_missed[pos] = pos_missed.get(pos, 0) + miss
+        pos_total[pos] = pos_total.get(pos, 0) + miss + played.get(pid, 0)
+    base_by_pos = {pos: pos_missed[pos] / pos_total[pos] for pos in pos_total if pos_total[pos]}
+    overall = (sum(pos_missed.values()) / sum(pos_total.values())) if sum(pos_total.values()) else 0.0
+    base_by_pos["_overall"] = overall
+
+    rates = {}
+    for pid, miss in missed.items():
+        total = miss + played.get(pid, 0)
+        if not total:
+            continue
+        pos = players_df.loc[pid, "position"] if pid in players_df.index else None
+        base = base_by_pos.get(pos, overall)
+        shrunk = (miss + base * INJURY_SHRINK_GAMES) / (total + INJURY_SHRINK_GAMES)
+        rates[pid] = min(shrunk, MAX_INJURY_RATE)
+    return rates, base_by_pos
+
+
+def compute_depth_adjusted_distribution(entries, roster_positions, injury_rates, injury_base,
+                                         nfl_team_of, rng):
+    """Expected weekly points AND week-to-week spread once byes and injuries are priced in,
+    instead of assuming every starter plays every week. Simulates DEPTH_SIM_WEEKS weeks: each
+    NFL team independently on bye (BYE_WEEK_SHARE), each remaining player independently out at
+    his own real injury rate, then the best lineup from whoever's left.
+
+    This is what makes depth matter, and why it's simulated rather than priced one absence at
+    a time: absences overlap. A bye takes out every player from the same NFL team at once, and
+    injuries land on top of that. A deep roster plugs the hole with someone comparable; a
+    top-heavy one is forced down to replacement level, and the second and third simultaneous
+    hole cost it far more than the first — a convexity that per-player expected values can't
+    see. The same simulation yields the spread, so a thin roster also correctly reads as more
+    volatile week to week, not just slightly worse on average."""
+    if not entries:
+        return 0.0, 0.0
+    nfl_teams = {nfl_team_of.get(e[2]) for e in entries if nfl_team_of.get(e[2])}
+    # Resolved once per roster, not once per simulated week: a player with no snap-count
+    # history still carries his position's real base risk, never zero.
+    out_rate = [injury_rates.get(e[2], injury_base.get(e[1], injury_base.get("_overall", 0.0)))
+                for e in entries]
+    totals = []
+    for _ in range(DEPTH_SIM_WEEKS):
+        on_bye = {t for t in nfl_teams if rng.random() < BYE_WEEK_SHARE}
+        available = [e for i, e in enumerate(entries)
+                     if nfl_team_of.get(e[2]) not in on_bye
+                     and rng.random() >= out_rate[i]]
+        totals.append(compute_optimal_lineup_score(roster_positions, available))
+    return float(np.mean(totals)), float(np.std(totals))
+
+
+def project_player_strength(pid, pos, player_form, medians, floors, market_values):
+    """One player's projected per-week points: his own real production (shrunk toward the
+    positional median by how few real games back it) blended MARKET_BLEND with real external
+    dynasty-market consensus. The market leg is a 0-100 percentile, mapped onto a points-like
+    scale (2x the positional median, so a 50th-percentile player lands near median
+    production) purely so the optimal-lineup solver can combine the two legs on one scale."""
+    median = medians.get(pos, medians.get("_overall", 0.0))
+    if pid in player_form:
+        ppg, games = player_form[pid]
+        k = games / (games + PLAYER_SHRINK_GAMES)
+        production = k * ppg + (1 - k) * median
+    else:
+        production = floors.get(pos, floors.get("_overall", 0.0))
+    market = (market_values.get(pid, 0.0) / 100.0) * max(median * 2.0, 1.0)
+    return (1 - MARKET_BLEND) * production + MARKET_BLEND * market
+
+
+def project_roster_distribution(league_id, roster_id, player_form, medians, floors, market_values,
+                                 roster_positions, players_df, injury_rates, injury_base,
+                                 nfl_team_of, rng):
+    """Current-roster-based (expected weekly points, absence-driven spread), replacing 'last
+    season's team average' as estimate_team_distributions' prior: project each currently-
+    rostered player (project_player_strength), then run them through the bye/injury depth
+    simulation (compute_depth_adjusted_distribution) so roster DEPTH counts. Uses
+    `rosters.players` -- the LIVE current roster for `league_id`'s own season, so an offseason
+    trade shows up here immediately, before any game has been played under the new roster.
+
+    Known, accepted limitation: for a PAST season's league_id this reads that season's
+    last-synced (~end-of-season) roster, not a true point-in-time-at-that-week snapshot --
+    only user-visible in build_upset_history's historical backtest, where an in-season trade
+    that happened later in a past season leaks backward into that season's earlier-week
+    upset probabilities."""
+    player_ids, _ = get_roster(league_id, roster_id)
+    entries = []
+    for pid in player_ids:
+        pos = players_df.loc[pid, "position"] if pid in players_df.index else None
+        if not pos:
+            continue
+        strength = project_player_strength(pid, pos, player_form, medians, floors, market_values)
+        entries.append((strength, pos, pid))
+    return compute_depth_adjusted_distribution(entries, roster_positions, injury_rates,
+                                                injury_base, nfl_team_of, rng)
+
+
+def estimate_team_distributions(league_id, standings, through_week=None, project_rosters=True):
     """Per-roster (mean, std) for a team's weekly score, blending this season's
-    own results with last season's average as a prior (more prior weight early
+    own results with a roster-composition-based prior (more prior weight early
     in the season, less as more of this season's games are in the books).
-    The mean is recency-weighted (a team's last few weeks count more than its
-    week 1) so the projection reflects current form, not just a flat season
-    average. The std is shrunk toward a prior the same way the mean is —
-    otherwise a team with only 3-4 games gets its raw, noisy sample std used
-    directly, which produces unstable, inconsistently-scaled variance
-    estimates team-to-team early in the season.
+    The mean's prior leg is a projection of the CURRENT roster — each rostered
+    player's real recent production blended with real external dynasty-market
+    consensus (project_roster_distribution / project_player_strength), combined via the
+    same optimal-lineup solver behind the Max PF stat — instead of last
+    season's team-level average. A trade made before any games this season now
+    moves the projection immediately, rather than waiting for the new players
+    to rack up real games under this roster. The mean is recency-weighted at both the player level
+    (build_player_form_index) and, for own_mean, the team level, so the
+    projection reflects current form, not a flat season average. The prior's
+    spread combines three real, independent sources of week-to-week variation:
+    this manager's own scoring history, how hard byes/injuries swing a
+    top-heavy roster (absence_std), and how uncertain any projection of a
+    roster that hasn't played yet inherently is (PROJECTION_UNCERTAINTY, which
+    fades as real results come in).
     `through_week` caps the window, e.g. to reconstruct last week's power
     rankings for a week-over-week movement indicator. Checked against
     `is not None`, not plain truthiness — through_week=0 (a real, meaningful
-    value meaning "before week 1 has happened, use only the prior-season
-    baseline") is falsy in Python, and a naive `if through_week` would treat
-    it as "no cap" and leak the entire season into what's supposed to be a
-    pre-week-1 estimate."""
+    value meaning "before week 1 has happened, use only the prior") is falsy
+    in Python, and a naive `if through_week` would treat it as "no cap" and
+    leak the entire season into what's supposed to be a pre-week-1
+    estimate.
+
+    `project_rosters=False` falls back to the older prior — this manager's own
+    prior-season average — and skips the roster projection entirely. That's
+    the right call for BACKTESTS over already-played weeks
+    (build_upset_history): `rosters` only holds each season's last-synced
+    roster, so projecting a past week from it would leak trades that hadn't
+    happened yet into that week's pre-game odds. It also keeps those callers
+    fast, since they re-estimate once per historical week."""
     prev_league_id = get_previous_league_id(league_id)
     week_filter = " AND week <= ?" if through_week is not None else ""
     week_params = (through_week,) if through_week is not None else ()
@@ -917,19 +1216,55 @@ def estimate_team_distributions(league_id, standings, through_week=None):
     fallback_mean = float(np.mean(league_scores)) if league_scores else 100.0
     fallback_std = float(np.std(league_scores)) if len(league_scores) >= 8 else 25.0
 
+    if project_rosters:
+        # Roster-projection inputs — computed ONCE per call, not per team/player, so this
+        # stays roughly the same cost class as the per-team loop below. Market values are read
+        # as of this league's own season end, which for the CURRENT (in-progress) season is a
+        # future date and therefore resolves to the latest available snapshot, while for a
+        # past season it avoids pricing that season's rosters at today's values.
+        season_row = load_table("SELECT season, synced_at FROM league_seasons WHERE league_id = ?",
+                                 params=(league_id,))
+        roster_positions = get_roster_positions(league_id)
+        players_df = get_players_df()
+        player_form = build_player_form_index(league_id, through_week=through_week)
+        medians, floors = compute_position_baselines(player_form, players_df)
+        market_values = compute_consensus_player_values(
+            season_row.iloc[0]["synced_at"] if not season_row.empty else None,
+            as_of_date=season_end_as_of_date(season_row.iloc[0]["season"]) if not season_row.empty else None,
+        )
+        injury_rates, injury_base = build_player_injury_rate(players_df)
+        nfl_team_of = players_df["team"].to_dict()
+        depth_rng = np.random.default_rng(DEPTH_SIM_SEED)
+
     distributions = {}
     for _, row in standings.iterrows():
+        rid = int(row["roster_id"])
         own_rows = load_table(
             f"SELECT week, points FROM matchups WHERE league_id = ? AND roster_id = ? AND points > 0{week_filter}",
-            params=(league_id, int(row["roster_id"]), *week_params),
+            params=(league_id, rid, *week_params),
         )
         own_scores = own_rows["points"].to_numpy()
-        prior_scores = get_owner_scores(prev_league_id, row["owner_id"])
-        prior_mean = float(np.mean(prior_scores)) if prior_scores else fallback_mean
-        prior_std = float(np.std(prior_scores)) if len(prior_scores) >= 3 else fallback_std
 
         games = len(own_scores)
         weight = games / (games + SHRINKAGE_GAMES)
+
+        prior_scores = get_owner_scores(prev_league_id, row["owner_id"])
+        if project_rosters:
+            prior_mean, absence_std = project_roster_distribution(
+                league_id, rid, player_form, medians, floors, market_values, roster_positions,
+                players_df, injury_rates, injury_base, nfl_team_of, depth_rng)
+        else:
+            prior_mean = float(np.mean(prior_scores)) if prior_scores else fallback_mean
+            absence_std = 0.0
+        scoring_std = float(np.std(prior_scores)) if len(prior_scores) >= 3 else fallback_std
+        # Independent sources of week-to-week spread, added in quadrature: how much this
+        # manager's scores have really bounced around, how much a thin roster swings when
+        # byes/injuries hit (absence_std), and — while the projection is still mostly a
+        # projection — how uncertain the roster estimate itself is. A top-heavy roster is
+        # genuinely more volatile than its scoring history alone implies, and a roster that
+        # hasn't played yet is genuinely less knowable than one that has.
+        projection_doubt = (1 - weight) * PROJECTION_UNCERTAINTY if project_rosters else 0.0
+        prior_std = float(np.sqrt(scoring_std ** 2 + absence_std ** 2 + projection_doubt ** 2))
 
         if games:
             weeks_ago = own_rows["week"].max() - own_rows["week"].to_numpy()
@@ -942,7 +1277,7 @@ def estimate_team_distributions(league_id, standings, through_week=None):
         mean = weight * own_mean + (1 - weight) * prior_mean
         std = weight * own_std + (1 - weight) * prior_std
 
-        distributions[int(row["roster_id"])] = (mean, max(std, 1.0))
+        distributions[rid] = (mean, max(std, 1.0))
     return distributions
 
 
@@ -954,27 +1289,38 @@ def get_roster_positions(league_id):
     return parse_json_field(df.iloc[0]["roster_positions"], []) if not df.empty else []
 
 
-def compute_optimal_lineup_score(roster_positions, entries):
-    """Best possible lineup score for one team-week: greedily fills the most
-    position-restrictive slots first (QB/RB/WR/TE/K), then FLEX (RB/WR/TE),
-    then SUPER_FLEX (any offensive position) last. Because FLEX's eligible
-    set is a subset of SUPER_FLEX's, this restrictive-first order is
-    provably optimal here, not just a heuristic."""
+def optimal_lineup_picks(roster_positions, entries):
+    """The (points, position) entries a best-possible lineup would actually start, for one
+    team-week: greedily fills the most position-restrictive slots first (QB/RB/WR/TE/K), then
+    FLEX (RB/WR/TE), then SUPER_FLEX (any offensive position) last. Because FLEX's eligible
+    set is a subset of SUPER_FLEX's, this restrictive-first order is provably optimal here,
+    not just a heuristic. Split out from compute_optimal_lineup_score (which is just its sum)
+    so callers that need to know WHICH players start — e.g. the depth simulation,
+    which prices what happens when one of them is out — don't have to re-derive it.
+
+    Each entry is indexed, not unpacked, so callers may pass either a plain (points, position)
+    pair or a longer tuple carrying extra fields (e.g. a player_id) straight through."""
     starting_slots = [s for s in roster_positions if s != "BN"]
     slot_order = sorted(starting_slots, key=lambda s: {"FLEX": 1, "SUPER_FLEX": 2}.get(s, 0))
 
     available = sorted(entries, key=lambda e: -e[0])
     used = [False] * len(available)
-    total = 0.0
+    picks = []
 
     for slot in slot_order:
         eligible = FLEX_ELIGIBLE.get(slot, {slot})
-        for i, (pts, pos) in enumerate(available):
-            if not used[i] and pos in eligible:
+        for i, entry in enumerate(available):
+            if not used[i] and entry[1] in eligible:
                 used[i] = True
-                total += pts
+                picks.append(entry)
                 break
-    return total
+    return picks
+
+
+def compute_optimal_lineup_score(roster_positions, entries):
+    """Total points of the best possible lineup for one team-week (see
+    optimal_lineup_picks for the slot-filling logic)."""
+    return float(sum(entry[0] for entry in optimal_lineup_picks(roster_positions, entries)))
 
 
 def find_best_bench_swap(roster_positions, starters, bench):
@@ -1279,7 +1625,12 @@ def build_upset_history(cache_key):
             actual = compute_actual_week_scores(schedule, roster_ids, week)
             if not actual:
                 continue
-            distributions = estimate_team_distributions(lid, standings_local, through_week=week - 1)
+            # project_rosters=False: this is a backtest of an already-played week, and
+            # `rosters` only has each season's last-synced roster -- projecting from it would
+            # leak trades made later that season into this week's pre-game odds.
+            distributions = estimate_team_distributions(lid, standings_local,
+                                                         through_week=week - 1,
+                                                         project_rosters=False)
             for _, pair in get_week_pairings(schedule, week).items():
                 if len(pair) != 2:
                     continue
@@ -2187,7 +2538,9 @@ def get_exact_draft_slot_map(league_id):
     fully complete every week is real data, so this isn't simulating anything,
     just replaying what actually happened."""
     local_standings = get_standings(league_id)
-    distributions = estimate_team_distributions(league_id, local_standings)
+    # project_rosters=False: exact replay of real results never samples these distributions,
+    # so the roster projection would be pure wasted work here.
+    distributions = estimate_team_distributions(league_id, local_standings, project_rosters=False)
     result = run_simulation(league_id, local_standings, distributions, n_trials=1)
     return {rid: int(round(info["expected_draft_slot"])) for rid, info in result.items()}
 
@@ -2922,7 +3275,8 @@ def get_completed_season_placements(league_id):
     (not approximate) because every week is real data, so there's no
     randomness left for the simulator to resolve."""
     standings_local = get_standings(league_id)
-    distributions = estimate_team_distributions(league_id, standings_local)
+    # project_rosters=False: same exact-replay reasoning as get_exact_draft_slot_map.
+    distributions = estimate_team_distributions(league_id, standings_local, project_rosters=False)
     result = run_simulation(league_id, standings_local, distributions, n_trials=1)
     top_n = get_playoff_settings(league_id)["playoff_teams"]
     slot_label = {top_n + 4: "champion", top_n + 3: "runner_up", top_n + 2: "third", top_n + 1: "fourth"}
@@ -3839,6 +4193,14 @@ def page_home():
                            f"{escape_markdown(biggest_blowout['b']['team_name'])} "
                            f"({biggest_blowout['margin']:.1f} pt margin)")
 
+            st.subheader("League News")
+            recap_article = get_league_news(league_id, week_choice)
+            if recap_article:
+                st.caption("AI-generated recap (Google Gemini), written from this week's real results.")
+                st.markdown(recap_article)
+            else:
+                st.caption("No AI recap generated for this week yet.")
+
 
 def page_recent_transactions():
     st.header("Recent Transactions")
@@ -4722,8 +5084,3 @@ pages = [
 ]
 pg = st.navigation(pages)
 pg.run()
-
-st.divider()
-st.caption(
-    "Not yet built: AI-generated League News. On the roadmap, no timeline yet."
-)
