@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-league-news-and-roster-projection"
+APP_BUILD = "2026-08-20-team-grades-rework"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -1146,9 +1146,55 @@ def project_player_strength(pid, pos, player_form, medians, floors, market_value
     return (1 - MARKET_BLEND) * production + MARKET_BLEND * market
 
 
-def project_roster_distribution(league_id, roster_id, player_form, medians, floors, market_values,
-                                 roster_positions, players_df, injury_rates, injury_base,
-                                 nfl_team_of, rng):
+def build_projection_inputs(league_id, through_week=None):
+    """Everything needed to project any roster in this league, gathered once: real per-player
+    production, positional baselines, market values, injury rates, and NFL teams. Shared by
+    estimate_team_distributions (Power Rankings / odds / upsets) and build_league_grades (Team
+    Pages), so a team's grade and its championship odds can't disagree about how good its
+    roster is.
+
+    Market values are read as of this league's own season end — for the CURRENT (in-progress)
+    season that's a future date, so it resolves to the latest available snapshot, while for a
+    past season it avoids pricing that season's rosters at today's values."""
+    season_row = load_table("SELECT season, synced_at FROM league_seasons WHERE league_id = ?",
+                             params=(league_id,))
+    players_df = get_players_df()
+    player_form = build_player_form_index(league_id, through_week=through_week)
+    medians, floors = compute_position_baselines(player_form, players_df)
+    injury_rates, injury_base = build_player_injury_rate(players_df)
+    return {
+        "roster_positions": get_roster_positions(league_id),
+        "players_df": players_df,
+        "player_form": player_form,
+        "medians": medians,
+        "floors": floors,
+        "market_values": compute_consensus_player_values(
+            season_row.iloc[0]["synced_at"] if not season_row.empty else None,
+            as_of_date=season_end_as_of_date(season_row.iloc[0]["season"]) if not season_row.empty else None,
+        ),
+        "injury_rates": injury_rates,
+        "injury_base": injury_base,
+        "nfl_team_of": players_df["team"].to_dict(),
+    }
+
+
+def build_roster_entries(league_id, roster_id, proj):
+    """(projected_points, position, player_id) for every currently-rostered player — the input
+    shape the optimal-lineup solver and depth simulation both consume."""
+    player_ids, _ = get_roster(league_id, roster_id)
+    players_df = proj["players_df"]
+    entries = []
+    for pid in player_ids:
+        pos = players_df.loc[pid, "position"] if pid in players_df.index else None
+        if not pos:
+            continue
+        strength = project_player_strength(pid, pos, proj["player_form"], proj["medians"],
+                                           proj["floors"], proj["market_values"])
+        entries.append((strength, pos, pid))
+    return entries
+
+
+def project_roster_distribution(league_id, roster_id, proj, rng):
     """Current-roster-based (expected weekly points, absence-driven spread), replacing 'last
     season's team average' as estimate_team_distributions' prior: project each currently-
     rostered player (project_player_strength), then run them through the bye/injury depth
@@ -1161,16 +1207,9 @@ def project_roster_distribution(league_id, roster_id, player_form, medians, floo
     only user-visible in build_upset_history's historical backtest, where an in-season trade
     that happened later in a past season leaks backward into that season's earlier-week
     upset probabilities."""
-    player_ids, _ = get_roster(league_id, roster_id)
-    entries = []
-    for pid in player_ids:
-        pos = players_df.loc[pid, "position"] if pid in players_df.index else None
-        if not pos:
-            continue
-        strength = project_player_strength(pid, pos, player_form, medians, floors, market_values)
-        entries.append((strength, pos, pid))
-    return compute_depth_adjusted_distribution(entries, roster_positions, injury_rates,
-                                                injury_base, nfl_team_of, rng)
+    return compute_depth_adjusted_distribution(
+        build_roster_entries(league_id, roster_id, proj), proj["roster_positions"],
+        proj["injury_rates"], proj["injury_base"], proj["nfl_team_of"], rng)
 
 
 def estimate_team_distributions(league_id, standings, through_week=None, project_rosters=True):
@@ -1217,23 +1256,7 @@ def estimate_team_distributions(league_id, standings, through_week=None, project
     fallback_std = float(np.std(league_scores)) if len(league_scores) >= 8 else 25.0
 
     if project_rosters:
-        # Roster-projection inputs — computed ONCE per call, not per team/player, so this
-        # stays roughly the same cost class as the per-team loop below. Market values are read
-        # as of this league's own season end, which for the CURRENT (in-progress) season is a
-        # future date and therefore resolves to the latest available snapshot, while for a
-        # past season it avoids pricing that season's rosters at today's values.
-        season_row = load_table("SELECT season, synced_at FROM league_seasons WHERE league_id = ?",
-                                 params=(league_id,))
-        roster_positions = get_roster_positions(league_id)
-        players_df = get_players_df()
-        player_form = build_player_form_index(league_id, through_week=through_week)
-        medians, floors = compute_position_baselines(player_form, players_df)
-        market_values = compute_consensus_player_values(
-            season_row.iloc[0]["synced_at"] if not season_row.empty else None,
-            as_of_date=season_end_as_of_date(season_row.iloc[0]["season"]) if not season_row.empty else None,
-        )
-        injury_rates, injury_base = build_player_injury_rate(players_df)
-        nfl_team_of = players_df["team"].to_dict()
+        proj = build_projection_inputs(league_id, through_week=through_week)
         depth_rng = np.random.default_rng(DEPTH_SIM_SEED)
 
     distributions = {}
@@ -1250,9 +1273,7 @@ def estimate_team_distributions(league_id, standings, through_week=None, project
 
         prior_scores = get_owner_scores(prev_league_id, row["owner_id"])
         if project_rosters:
-            prior_mean, absence_std = project_roster_distribution(
-                league_id, rid, player_form, medians, floors, market_values, roster_positions,
-                players_df, injury_rates, injury_base, nfl_team_of, depth_rng)
+            prior_mean, absence_std = project_roster_distribution(league_id, rid, proj, depth_rng)
         else:
             prior_mean = float(np.mean(prior_scores)) if prior_scores else fallback_mean
             absence_std = 0.0
@@ -1877,6 +1898,28 @@ def to_grade(percentile_series):
     return pd.cut(percentile_series, bins=bins, labels=labels, include_lowest=True)
 
 
+GRADE_Z_BINS = [(1.00, "A"), (0.40, "B"), (0.00, "C+"), (-0.40, "C"), (-1.00, "D")]
+
+
+def zscore_to_grade(series):
+    """Grade on how far a team really sits from the league average, in standard deviations —
+    not on its rank. With only 8 teams, rank percentiles are locked to 0.125/0.25/0.375/...
+    no matter whether last place is a hair behind or in a different league entirely, and
+    averaging several of those ranks squeezes everyone toward the middle: the genuinely worst
+    roster in this league was landing a C, tied with a clearly better team. Magnitude-based
+    bands let a real gap show up as a real grade gap."""
+    std = series.std(ddof=0)
+    z = (series - series.mean()) / std if std and not pd.isna(std) else series * 0.0
+
+    def band(v):
+        for threshold, label in GRADE_Z_BINS:
+            if v >= threshold:
+                return label
+        return "F"
+
+    return z.apply(band)
+
+
 GRADE_COLORS = {"F": "#DC2626", "D": "#EA580C", "C": "#F59E0B", "C+": "#CA8A04", "B": "#65A30D", "A": "#16A34A"}
 GRADE_ORDER = {"F": 0, "D": 1, "C": 2, "C+": 3, "B": 4, "A": 5}
 
@@ -1906,27 +1949,64 @@ def style_grades(df, columns):
     return df.style.map(_color, subset=columns)
 
 
+FUTURE_CORE_PLAYERS = 15  # how deep "future value" counts: roughly a full starting lineup plus
+# immediate backups. Summing value across the WHOLE roster instead graded roster QUANTITY —
+# a team carrying 31 middling players outscored a top-heavy contender and landed a C while the
+# league's strongest roster got a D, because a superstar counted the same as two spare parts.
+BENCH_DEPTH_PLAYERS = 5  # how many of the best non-starters the bench grade reflects, for the
+# same reason: depth means having good replacements, not merely having many bodies.
+CONTEND_WEIGHT = 0.5  # split between win-now strength and future value in the overall grade.
+
+
 def build_league_grades(league_id, value_table, standings):
+    """Team grades from two real, separately-graded halves: win-now strength (the projected
+    starting lineup, depth-discounted — the same projection behind Power Rankings and
+    championship odds, so a team's grade can't contradict its odds) and future value
+    (youth-adjusted market value of its core, not a headcount of its whole roster)."""
+    proj = build_projection_inputs(league_id)
+    rng = np.random.default_rng(DEPTH_SIM_SEED)
+
     records = []
     for _, row in standings.iterrows():
         roster_id = int(row["roster_id"])
         player_ids, starter_ids = get_roster(league_id, roster_id)
         metrics = team_overview_metrics(value_table, player_ids, starter_ids)
         metrics["roster_id"] = roster_id
+
+        entries = build_roster_entries(league_id, roster_id, proj)
+        contend, _spread = compute_depth_adjusted_distribution(
+            entries, proj["roster_positions"], proj["injury_rates"], proj["injury_base"],
+            proj["nfl_team_of"], rng)
+        metrics["contender_score"] = contend
+
+        starting = optimal_lineup_picks(proj["roster_positions"], entries)
+        starting_ids = {e[2] for e in starting}
+        metrics["starter_value"] = contend
+        metrics["bench_value"] = sum(
+            sorted((e[0] for e in entries if e[2] not in starting_ids), reverse=True
+                   )[:BENCH_DEPTH_PLAYERS])
+
+        team_values = value_table.loc[value_table.index.intersection(player_ids)]
+        youth_adjusted = team_values["value"] * (
+            1 + (27 - team_values["age"].fillna(27)).clip(lower=0) * 0.03)
+        metrics["future_score"] = float(youth_adjusted.nlargest(FUTURE_CORE_PLAYERS).sum())
         records.append(metrics)
+
     league_df = pd.DataFrame(records).set_index("roster_id")
 
+    contend_std = league_df["contender_score"].std(ddof=0)
+    future_std = league_df["future_score"].std(ddof=0)
+    contend_z = ((league_df["contender_score"] - league_df["contender_score"].mean()) / contend_std
+                  if contend_std else league_df["contender_score"] * 0.0)
+    future_z = ((league_df["future_score"] - league_df["future_score"].mean()) / future_std
+                 if future_std else league_df["future_score"] * 0.0)
     league_df["contender_pct"] = league_df["contender_score"].rank(pct=True)
     league_df["future_pct"] = league_df["future_score"].rank(pct=True)
 
-    composite = (
-        league_df["dynasty_score"].rank(pct=True)
-        + league_df["contender_pct"]
-        + league_df["future_pct"]
-    ) / 3
-    league_df["overall_grade"] = to_grade(composite)
-    league_df["starter_grade"] = to_grade(league_df["starter_value"].rank(pct=True))
-    league_df["bench_grade"] = to_grade(league_df["bench_value"].rank(pct=True))
+    composite = CONTEND_WEIGHT * contend_z + (1 - CONTEND_WEIGHT) * future_z
+    league_df["overall_grade"] = zscore_to_grade(composite)
+    league_df["starter_grade"] = zscore_to_grade(league_df["starter_value"])
+    league_df["bench_grade"] = zscore_to_grade(league_df["bench_value"])
     return league_df
 
 
@@ -1964,10 +2044,10 @@ def get_positional_grades(league_id, season_year, cache_key):
 
 def team_competitive_state(contender_pct, future_pct):
     """contender_pct/future_pct are each team's league-wide percentile rank (0-1) on
-    win-now starter value vs. age-adjusted roster value — comparable scales, unlike
-    the raw sums (future_score sums the whole roster with an age multiplier on top,
-    so it dwarfs contender_score's starters-only total for nearly every team if
-    compared directly). Returns "contend", "rebuild", or "balanced"."""
+    projected win-now lineup strength vs. age-adjusted value of its core — percentile
+    ranks rather than the raw scores because the two are on entirely different units
+    (projected points per week vs. market value), so comparing them directly would be
+    meaningless. Returns "contend", "rebuild", or "balanced"."""
     edge = contender_pct - future_pct
     if edge > 0.25:
         return "contend"
@@ -4295,8 +4375,11 @@ def page_team_pages():
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Overall Grade", str(grade_row["overall_grade"]))
     c2.metric("Dynasty Score", f"{metrics['dynasty_score']:.0f}", f"#{dynasty_rank} of {n_teams}")
-    c3.metric("Contender Score", f"{metrics['contender_score']:.0f}", f"#{contender_rank} of {n_teams}")
-    c4.metric("Future Score", f"{metrics['future_score']:.0f}", f"#{future_rank} of {n_teams}")
+    # Contender/Future read off grade_row, not `metrics` — build_league_grades computes these
+    # two on a different (better) basis than team_overview_metrics' raw sums, and showing one
+    # number next to a rank derived from the other would contradict itself.
+    c3.metric("Contender Score", f"{grade_row['contender_score']:.0f}", f"#{contender_rank} of {n_teams}")
+    c4.metric("Future Score", f"{grade_row['future_score']:.0f}", f"#{future_rank} of {n_teams}")
 
     c5, c6, c7 = st.columns(3)
     avg_age = metrics["avg_age"]
