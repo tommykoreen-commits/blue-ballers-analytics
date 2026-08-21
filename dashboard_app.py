@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-bench-depth-grade"
+APP_BUILD = "2026-08-20-pick-value-overall-curve"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -271,7 +271,7 @@ EXTERNAL_PICK_SLOTS_PER_ROUND = 12  # DynastyProcess/FantasyCalc both label pick
 # industry-standard 12-team draft-slot scale (1.01-1.12) regardless of query params —
 # confirmed empirically (FantasyCalc still returned slots up to 1.12 with numTeams=8
 # passed). This league's real 8-team slot needs mapping onto that scale before any
-# lookup — see _map_to_external_slot.
+# lookup — see _map_to_external_pick.
 EXTERNAL_PICK_TIER_SLOT = {"early": 2, "mid": 6, "late": 10}  # representative external
 # slot per FantasyCalc out-year tier bucket, used as anchor points
 
@@ -377,93 +377,111 @@ def compute_consensus_player_values(cache_key, as_of_date=None):
     return consensus
 
 
-def _map_to_external_slot(our_slot, our_team_count):
-    """Proportionally map this league's 1..our_team_count slot onto the
-    external 1..EXTERNAL_PICK_SLOTS_PER_ROUND scale (linear across the round)."""
-    if our_team_count <= 1:
-        return 1.0
-    frac = (our_slot - 1) / (our_team_count - 1)
-    return 1 + frac * (EXTERNAL_PICK_SLOTS_PER_ROUND - 1)
+def _map_to_external_pick(our_round, our_slot, our_team_count):
+    """Map one of this league's picks onto the external 12-team scale by OVERALL pick number,
+    returning (external_round, external_slot).
+
+    By overall number, not by position within the round: the Nth pick of any rookie draft
+    selects from the same depth of talent pool regardless of league size, so overall number is
+    what actually transfers between a 8-team league and the 12-team scale the market prices on.
+    Stretching each round proportionally instead (this league's slot 8 of 8 -> external slot 12
+    of 12) broke cross-round comparisons — our last first-rounder is overall pick 8 and our
+    first second-rounder is overall pick 9, adjacent picks, but proportional mapping priced them
+    as a 12-team 1.12 and 2.01 and had the second-rounder come out AHEAD. Mapping by overall
+    number puts them at 1.08 and 1.09, correctly near-equal and correctly ordered."""
+    if our_team_count < 1:
+        return our_round, float(our_slot)
+    overall = (our_round - 1) * our_team_count + our_slot
+    ext_round = int(np.ceil(overall / EXTERNAL_PICK_SLOTS_PER_ROUND))
+    ext_slot = overall - (ext_round - 1) * EXTERNAL_PICK_SLOTS_PER_ROUND
+    return ext_round, float(ext_slot)
 
 
-def _interpolate_via_decay_shape(ext_slot, round_no, anchors_by_ext_slot):
-    """Value at ext_slot given 1+ real market anchor points (FantasyCalc's
-    Early/Mid/Late tier values, placed at their representative external
-    slot). Between two real anchors, interpolates log-linearly (geometric
-    interpolation) directly between them — NOT via the in-house decay shape's
-    own curvature, which is markedly steeper than FantasyCalc's real
-    early-to-late gap and forcing it onto real anchors produced a
-    non-monotonic result (a slot 3 pick coming out cheaper than slot 4).
-    Outside the anchors' span (or with only one anchor), extrapolates using
-    the in-house shape's *relative* decay ratio from the nearest anchor —
-    real data sets the level, in-house math only extends the tail."""
-    anchor_slots = sorted(anchors_by_ext_slot)
-    if len(anchor_slots) == 1 or ext_slot <= anchor_slots[0] or ext_slot >= anchor_slots[-1]:
-        nearest = min(anchor_slots, key=lambda s: abs(s - ext_slot))
-        shape_nearest = pick_slot_value(round_no, nearest)
-        if not shape_nearest:
-            return anchors_by_ext_slot[nearest]
-        return anchors_by_ext_slot[nearest] * (pick_slot_value(round_no, ext_slot) / shape_nearest)
-    log_vals = np.log([anchors_by_ext_slot[s] for s in anchor_slots])
-    return float(np.exp(np.interp(ext_slot, anchor_slots, log_vals)))
+def _overall_to_round_slot(overall):
+    """External overall pick number -> (round, slot) on the external 12-slot scale."""
+    ext_round = int(np.ceil(overall / EXTERNAL_PICK_SLOTS_PER_ROUND))
+    return max(ext_round, 1), overall - (max(ext_round, 1) - 1) * EXTERNAL_PICK_SLOTS_PER_ROUND
 
 
-def _scale_decay_shape_to_anchor(ext_slot, round_no, anchor_value):
-    """Same idea as _interpolate_via_decay_shape but for a single per-round
-    anchor (2028+ picks, where FantasyCalc gives one number for the whole
-    round, no tiers) — scale the in-house shape so its round-average matches
-    that one anchor, then read off ext_slot's scaled value."""
-    round_avg_shape = np.mean([pick_slot_value(round_no, s) for s in range(1, EXTERNAL_PICK_SLOTS_PER_ROUND + 1)])
-    if not round_avg_shape:
+def _shape_at_overall(overall):
+    """In-house decay shape read at an external OVERALL pick number, so the shape can be used
+    to extend a curve past the last real anchor without re-introducing a per-round seam."""
+    ext_round, ext_slot = _overall_to_round_slot(overall)
+    return pick_slot_value(ext_round, ext_slot)
+
+
+def _value_at_overall(overall, anchors_by_overall):
+    """Value at an external overall pick number, given real market anchors keyed by overall
+    pick number. Between two anchors, interpolates log-linearly (geometric) directly between
+    them — NOT via the in-house decay shape's curvature, which is markedly steeper than the
+    market's real early-to-late gap and produced non-monotonic results when forced onto real
+    anchors. Outside the anchors' span, extends by the in-house shape's *relative* decay ratio
+    from the nearest anchor: real data sets the level, in-house math only extends the tail.
+
+    Keyed by OVERALL pick rather than per-round slot so one continuous curve spans every round.
+    Pricing each round against its own anchors left a seam at the round boundary — a mid-second
+    could come out above an early-second one pick earlier — since the two rounds' anchor sets
+    carry no guarantee of joining smoothly."""
+    anchor_points = sorted(anchors_by_overall)
+    if not anchor_points:
         return None
-    return pick_slot_value(round_no, ext_slot) * (anchor_value / round_avg_shape)
+    if len(anchor_points) == 1 or overall <= anchor_points[0] or overall >= anchor_points[-1]:
+        nearest = min(anchor_points, key=lambda s: abs(s - overall))
+        shape_nearest = _shape_at_overall(nearest)
+        if not shape_nearest:
+            return anchors_by_overall[nearest]
+        return anchors_by_overall[nearest] * (_shape_at_overall(overall) / shape_nearest)
+    log_vals = np.log([anchors_by_overall[s] for s in anchor_points])
+    return float(np.exp(np.interp(overall, anchor_points, log_vals)))
 
 
 def _pick_raw_value(pick_latest, source, season, round_no, our_slot, our_team_count, higher_is_better=True):
-    """One source's raw value for a specific (season, round, our_slot) pick,
-    at whatever granularity that source actually has for that season:
-      - exact_slot (current draft class, both sources): map our_slot onto
-        the external 12-slot scale, linearly interpolate between the two
-        nearest listed external slots — direction-agnostic, safe as is.
-      - tier (next season out) / round (2+ seasons out): both sources
-        actually carry these (not FantasyCalc alone — DynastyProcess's
-        values.csv turns out to include round-level entries for 2027/2028
-        too, found only once real out-year data was tested; confirmed via
+    """One source's raw value for one of this league's specific picks.
+
+    Every anchor this source has for that season — at whatever granularity it carries — is
+    placed on a single OVERALL-pick-number axis and read as one continuous curve
+    (_value_at_overall), rather than each round being priced against only its own anchors:
+      - exact_slot (current draft class, both sources): the listed slot itself.
+      - tier (next season out): the tier's representative slot, per EXTERNAL_PICK_TIER_SLOT.
+      - round (2+ seasons out): the round's midpoint. Both sources carry these — not
+        FantasyCalc alone; DynastyProcess's values.csv includes round-level entries for
+        2027/2028 too, found only once real out-year data was tested (confirmed via
         `sorted(pick_df[pick_df["source"]=="dynastyprocess_value"]["season"].unique())`
-        showing 2025-2028). Anchors real market data at representative
-        slots, in-house decay shape fills the gaps/tail. The anchor math
-        assumes "higher raw value = better" — for the ecr signal (lower
-        rank = better) the anchor is passed through as its reciprocal so
-        the shape math stays in a consistent direction, then inverted back.
-      - nothing at all: None — caller falls back to the plain in-house
-        formula for that source's contribution.
+        showing 2025-2028).
+    Finer granularity wins where two would land on the same overall pick. Returns None when
+    this source has nothing for that season at all — caller then falls back to the plain
+    in-house formula for that source's contribution.
+
+    The anchor math assumes "higher raw value = better"; for the ecr signal (lower rank =
+    better) values pass through as their reciprocal so the curve math stays in a consistent
+    direction, then invert back.
     """
-    rows = pick_latest[(pick_latest["source"] == source) & (pick_latest["season"] == str(season)) &
-                        (pick_latest["round"] == round_no)]
+    rows = pick_latest[(pick_latest["source"] == source) & (pick_latest["season"] == str(season))]
     if rows.empty:
         return None
-    ext_slot = _map_to_external_slot(our_slot, our_team_count)
-
-    exact = rows[rows["granularity"] == "exact_slot"].sort_values("slot")
-    if not exact.empty:
-        return float(np.interp(ext_slot, exact["slot"].astype(float), exact["raw_value"].astype(float)))
 
     to_goodness = (lambda v: v) if higher_is_better else (lambda v: 1.0 / v)
     from_goodness = to_goodness  # reciprocal is its own inverse
 
-    tier = rows[rows["granularity"] == "tier"]
-    if not tier.empty:
-        anchors = {EXTERNAL_PICK_TIER_SLOT[t]: to_goodness(v) for t, v in zip(tier["tier"], tier["raw_value"])
-                   if t in EXTERNAL_PICK_TIER_SLOT}
-        if anchors:
-            result = _interpolate_via_decay_shape(ext_slot, round_no, anchors)
-            return None if result is None else from_goodness(result)
+    def overall_of(ext_round, ext_slot):
+        return (int(ext_round) - 1) * EXTERNAL_PICK_SLOTS_PER_ROUND + float(ext_slot)
 
-    round_row = rows[rows["granularity"] == "round"]
-    if not round_row.empty:
-        anchor = to_goodness(float(round_row["raw_value"].iloc[0]))
-        result = _scale_decay_shape_to_anchor(ext_slot, round_no, anchor)
-        return None if result is None else from_goodness(result)
+    anchors = {}
+    for _, r in rows[rows["granularity"] == "exact_slot"].iterrows():
+        anchors[overall_of(r["round"], r["slot"])] = to_goodness(float(r["raw_value"]))
+    for _, r in rows[rows["granularity"] == "tier"].iterrows():
+        if r["tier"] in EXTERNAL_PICK_TIER_SLOT:
+            anchors.setdefault(overall_of(r["round"], EXTERNAL_PICK_TIER_SLOT[r["tier"]]),
+                               to_goodness(float(r["raw_value"])))
+    for _, r in rows[rows["granularity"] == "round"].iterrows():
+        anchors.setdefault(overall_of(r["round"], (EXTERNAL_PICK_SLOTS_PER_ROUND + 1) / 2),
+                           to_goodness(float(r["raw_value"])))
+    if not anchors:
+        return None
+
+    ext_round, ext_slot = _map_to_external_pick(round_no, our_slot, our_team_count)
+    result = _value_at_overall(overall_of(ext_round, ext_slot), anchors)
+    return None if result is None else from_goodness(result)
 
     return None
 
@@ -2173,14 +2191,32 @@ def get_traded_picks_map(league_id):
     return {(row["season"], row["round"], row["roster_id"]): row["owner_id"] for _, row in df.iterrows()}
 
 
+def rookie_draft_is_complete(league_id, season_year):
+    """Whether this season's rookie draft has already been held — real Sleeper draft status,
+    not a date guess."""
+    df = load_table(
+        "SELECT status FROM drafts WHERE league_id = ? AND season = ?",
+        params=(league_id, str(season_year)),
+    )
+    return not df.empty and str(df.iloc[0]["status"]).lower() == "complete"
+
+
+def first_unspent_pick_season(league_id, season_year):
+    """The earliest season whose picks are still real, tradeable assets. Once this season's
+    rookie draft is complete its picks have become players and are no longer future capital —
+    listing them as draft capital double-counts the roster they already turned into."""
+    return season_year + 1 if rookie_draft_is_complete(league_id, season_year) else season_year
+
+
 def build_pick_inventory(league_id, season_year, standings, seasons_ahead=3):
     draft_rounds = get_draft_rounds(league_id)
     traded = get_traded_picks_map(league_id)
     roster_ids = [int(rid) for rid in standings["roster_id"].tolist()]
+    first_season = first_unspent_pick_season(league_id, season_year)
 
     picks = []
     for offset in range(seasons_ahead):
-        pick_season = str(season_year + offset)
+        pick_season = str(first_season + offset)
         for round_no in range(1, draft_rounds + 1):
             for original_roster in roster_ids:
                 owner = traded.get((pick_season, round_no, original_roster), original_roster)
@@ -2274,10 +2310,11 @@ def pick_value(round_no, original_roster_power_percentile, slot_distribution=Non
 
 
 def value_pick_row(row, power_pct, current_season_str, odds, cache_key=None):
-    """Value one row of a pick inventory table. `current_season_str` is whichever
-    season `odds` (the Championship Odds simulator's output) was run for — only a
-    pick in THAT season has a real simulated slot distribution to use; anything
-    further out falls back to pick_value's percentile-estimated slot."""
+    """Value one row of a pick inventory table. `current_season_str` is the season whose
+    draft order the `odds` simulation actually determines — i.e. the NEXT rookie draft, since
+    a draft's order comes from the season played before it. Only that season's picks have a
+    real simulated slot distribution; anything further out falls back to pick_value's
+    percentile-estimated slot."""
     if row["season"] == current_season_str:
         dist = odds.get(int(row["original_roster_id"]), {}).get("draft_slot_distribution")
         if dist:
@@ -4494,7 +4531,8 @@ def page_team_pages():
     team_picks = pick_inventory[pick_inventory["owner_roster_id"] == roster_id].copy()
     power_pct = dict(zip(rankings["roster_id"], rankings["power_score"].rank(pct=True)))
     team_picks["Value"] = team_picks.apply(
-        lambda r: value_pick_row(r, power_pct, str(season_year), odds, cache_key=synced_at), axis=1
+        lambda r: value_pick_row(r, power_pct, str(first_unspent_pick_season(league_id, season_year)),
+                                  odds, cache_key=synced_at), axis=1
     )
     team_picks["Original Team"] = team_picks["original_roster_id"].map(team_lookup)
     team_picks = team_picks.sort_values(["season", "round"])
@@ -4897,7 +4935,9 @@ def page_rookie_draft():
     league_pick_inventory = get_pick_inventory(league_id, int(season_choice), synced_at).copy()
     league_power_pct = dict(zip(rankings["roster_id"], rankings["power_score"].rank(pct=True)))
     league_pick_inventory["Value"] = league_pick_inventory.apply(
-        lambda r: value_pick_row(r, league_power_pct, str(season_choice), odds, cache_key=synced_at), axis=1
+        lambda r: value_pick_row(r, league_power_pct,
+                                  str(first_unspent_pick_season(league_id, int(season_choice))),
+                                  odds, cache_key=synced_at), axis=1
     )
     league_pick_inventory["Original Team"] = league_pick_inventory["original_roster_id"].map(team_lookup)
     league_pick_inventory["Current Owner"] = league_pick_inventory["owner_roster_id"].map(team_lookup)
