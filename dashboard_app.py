@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-offseason-labels-and-provenance"
+APP_BUILD = "2026-08-20-fix-trade-residual"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -4986,10 +4986,15 @@ def page_trade_center():
         )
         conclusion = build_trade_conclusion(seed_txn, players_df, synced_at)
         name_by_owner = get_manager_name_lookup()
+        # Keyed to the selected trade so switching trades builds a FRESH subtree instead of
+        # reusing the previous one. Without it the number of side-by-side columns changes
+        # between a two-team and a three-team trade, and the browser kept showing leftovers
+        # of the trade you'd just navigated away from.
+        conclusion_box = st.container(key=f"trade_conclusion_{seed_txn['transaction_id']}")
         if not conclusion:
-            st.info("Couldn't resolve the sides of this trade.")
+            conclusion_box.info("Couldn't resolve the sides of this trade.")
         else:
-            cols = st.columns(len(conclusion))
+            cols = conclusion_box.columns(len(conclusion))
             for col, (owner, info) in zip(cols, conclusion.items()):
                 with col:
                     st.markdown(f"**{escape_markdown(name_by_owner.get(owner, str(owner)))}**")
@@ -5008,7 +5013,8 @@ def page_trade_center():
                         st.caption("Dropped along the way: "
                                     + ", ".join(escape_markdown(l["label"]) for l in info["lost"]))
 
-        with st.expander("Full asset-by-asset trail"):
+        with st.expander("Full asset-by-asset trail",
+                          key=f"trade_trail_{seed_txn['transaction_id']}"):
             chains = build_trade_lineage(seed_txn, players_df, synced_at)
             blocks = render_trade_lineage_timeline(chains, players_df, global_team_lookup)
             if not blocks:
