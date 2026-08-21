@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-pick-value-overall-curve"
+APP_BUILD = "2026-08-20-asset-trail"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -2673,10 +2673,10 @@ def describe_trade(txn, players_df, league_id, global_team_lookup):
 
 
 # ---------------------------------------------------------------------------
-# Trade Tree — starting from one trade, traces every asset involved (players AND
+# Asset Trail — starting from one trade, traces every asset involved (players AND
 # picks) both backward (where it came from) and forward (everywhere it went,
-# including what a traded pick actually turned into once drafted) into a Sankey
-# diagram. A pick's `roster_id` field in a trade's JSON is the ORIGINAL owner and
+# including what a traded pick actually turned into once drafted), rendered as a
+# chronological per-asset timeline. A pick's `roster_id` field in a trade's JSON is the ORIGINAL owner and
 # stays constant across every re-trade (only owner_id/previous_owner_id change per
 # hop), which is what makes tracing a single pick's full lineage tractable at all.
 # ---------------------------------------------------------------------------
@@ -2696,13 +2696,17 @@ def get_all_pick_trade_events(cache_key):
     for _, srow in all_seasons.iterrows():
         lid = srow["league_id"]
         txns = load_table(
-            "SELECT transaction_id, draft_picks, created FROM transactions WHERE league_id = ? AND type = 'trade'",
+            "SELECT transaction_id, week, draft_picks, created FROM transactions WHERE league_id = ? AND type = 'trade'",
             params=(lid,),
         )
         for _, txn in txns.iterrows():
             for p in parse_json_field(txn["draft_picks"], []):
                 rows.append({
                     "transaction_id": txn["transaction_id"], "league_id": lid, "created": txn["created"],
+                    # when the TRADE happened -- distinct from pick_season (the draft the pick is
+                    # for). Labeling a hop with the pick's own season read as though a 2027 pick
+                    # had been traded in 2027, years before it actually was.
+                    "trade_season": srow["season"], "trade_week": txn["week"],
                     "pick_season": p.get("season"), "pick_round": p.get("round"),
                     "original_roster_id": p.get("roster_id"),
                     "owner_id": p.get("owner_id"), "previous_owner_id": p.get("previous_owner_id"),
@@ -2867,7 +2871,8 @@ def trace_pick_forward(pick_season, pick_round, original_roster_id, seed_created
         if later.empty:
             break
         hop_row = later.iloc[0]
-        fake_event = {"season": pick_season, "league_id": hop_row["league_id"], "week": None, "type": "trade",
+        fake_event = {"season": hop_row["trade_season"], "league_id": hop_row["league_id"],
+                      "week": hop_row["trade_week"], "type": "trade",
                       "roster_id": hop_row["owner_id"], "transaction_id": hop_row["transaction_id"], "draft_id": None}
         hops.append({"event": fake_event, "asset_label": pick_label})
         cursor = hop_row["created"]
@@ -2903,7 +2908,8 @@ def trace_pick_backward(pick_season, pick_round, original_roster_id, seed_create
         if earlier.empty:
             break
         hop_row = earlier.iloc[0]
-        fake_event = {"season": pick_season, "league_id": hop_row["league_id"], "week": None, "type": "trade",
+        fake_event = {"season": hop_row["trade_season"], "league_id": hop_row["league_id"],
+                      "week": hop_row["trade_week"], "type": "trade",
                       "roster_id": hop_row["previous_owner_id"], "transaction_id": hop_row["transaction_id"],
                       "draft_id": None}
         hops.append({"event": fake_event, "asset_label": pick_label})
@@ -2924,13 +2930,17 @@ def build_trade_lineage(seed_txn, players_df, cache_key):
 
     chains = []
     for player_id in adds:
+        name = (players_df.loc[player_id, "full_name"]
+                if player_id in players_df.index else str(player_id))
         chains.append({
+            "asset": name,
             "backward": trace_player_chain(player_id, seed_transaction_id, None, -1, players_df, cache_key),
             "forward": trace_player_chain(player_id, seed_transaction_id, None, 1, players_df, cache_key),
         })
     for p in picks:
         pick_season, pick_round, original_roster_id = p.get("season"), p.get("round"), p.get("roster_id")
         chains.append({
+            "asset": f"{pick_season} Round {pick_round} pick",
             "backward": trace_pick_backward(pick_season, pick_round, original_roster_id, seed_created, pick_events_df),
             "forward": trace_pick_forward(pick_season, pick_round, original_roster_id, seed_created,
                                            pick_events_df, players_df, cache_key),
@@ -2938,60 +2948,66 @@ def build_trade_lineage(seed_txn, players_df, cache_key):
     return chains
 
 
-def render_trade_lineage_sankey(seed_txn, chains, players_df, global_team_lookup):
-    """Renders a Trade Tree lineage as a Sankey diagram: backward chains flow into
-    the seed trade from the left, forward chains flow out to the right. Returns
-    None if there's nothing to show (no chain had any hops)."""
-    node_index = {}
-    node_labels = []
+def render_trade_lineage_timeline(chains, players_df, global_team_lookup):
+    """One readable chronological story per asset in the trade: where it came from, this trade,
+    then everywhere it went — ending with what it ultimately became.
 
-    def node_key(event):
-        if event.get("transaction_id") is not None:
-            return ("txn", event["transaction_id"])
-        if event.get("draft_id") is not None:
-            # include player_id — a draft_id alone identifies the whole draft, not
-            # the specific pick, so two different players taken in the same draft
-            # must not collapse into one Sankey node
-            return ("draft", event["draft_id"], event.get("player_id"))
-        return ("unknown", id(event))
+    Deliberately not a Sankey (which this used to be). A Sankey's whole visual language is link
+    WIDTH = quantity, but every hop here is one asset moving once, so every link was the same
+    width and the diagram carried no magnitude information at all — while the only thing anyone
+    actually wants to read, which asset moved and what it turned into, sat in hover-only link
+    labels. Provenance is a timeline, so it reads as one.
 
-    def get_node_idx(key, label):
-        if key not in node_index:
-            node_index[key] = len(node_labels)
-            node_labels.append(label)
-        return node_index[key]
-
-    seed_summary = " / ".join(describe_trade(seed_txn, players_df, seed_txn["league_id"], global_team_lookup))
-    seed_idx = get_node_idx("SEED", f"This trade — {seed_summary}"[:90])
-
-    sources, targets, values, link_labels = [], [], [], []
+    Returns a list of (asset_label, markdown_lines, outcome) — empty if no asset had any
+    history on either side of this trade."""
+    blocks = []
     for chain in chains:
-        prev_idx = seed_idx
-        for hop in chain["backward"]:
-            idx = get_node_idx(node_key(hop["event"]), event_label(hop["event"], global_team_lookup, players_df))
-            sources.append(idx)
-            targets.append(prev_idx)
-            values.append(1)
-            link_labels.append(hop["asset_label"])
-            prev_idx = idx
+        backward, forward = chain["backward"], chain["forward"]
+        if not backward and not forward:
+            continue
+        # backward hops come back closest-first; reverse so the story reads oldest -> newest
+        ordered = [("before", h) for h in reversed(backward)] + [("after", h) for h in forward]
+        lines = []
+        last_holder = None
+        for phase, hop in ordered:
+            if phase == "after" and not any(l.startswith("**◆") for l in lines):
+                lines.append("**◆ this trade**")
+            event = hop["event"]
+            holder = (event["league_id"], event["roster_id"])
+            # Collapse consecutive events that leave the asset with the same team (a drop and
+            # re-add by one manager, say) -- the trail is about where an asset CHANGED hands.
+            if event["type"] != "draft" and holder == last_holder:
+                continue
+            lines.append(f"↳ {event_label(event, global_team_lookup, players_df)}")
+            last_holder = holder
+        if not any(l.startswith("**◆") for l in lines):
+            lines.append("**◆ this trade**")
 
-        prev_idx = seed_idx
-        for hop in chain["forward"]:
-            idx = get_node_idx(node_key(hop["event"]), event_label(hop["event"], global_team_lookup, players_df))
-            sources.append(prev_idx)
-            targets.append(idx)
-            values.append(1)
-            link_labels.append(hop["asset_label"])
-            prev_idx = idx
+        outcome = None
+        if forward:
+            def team_of(event):
+                return escape_markdown(global_team_lookup.get(
+                    (event["league_id"], event["roster_id"]), f"Roster {event['roster_id']}"))
 
-    if not sources:
-        return None
-    fig = go.Figure(go.Sankey(
-        node=dict(label=node_labels, pad=20, thickness=15),
-        link=dict(source=sources, target=targets, value=values, label=link_labels),
-    ))
-    fig.update_layout(font_size=11, height=520, margin=dict(l=10, r=10, t=10, b=10))
-    return fig
+            # The draft is the headline for a pick — it's the moment the asset became a real
+            # player — so look for it anywhere in the trail, not just at the end. A later waiver
+            # or trade would otherwise bury the one thing worth reading.
+            drafted = next((h["event"] for h in forward
+                            if h["event"]["type"] == "draft" and h["event"].get("player_id")), None)
+            last = forward[-1]["event"]
+            if drafted is not None:
+                pid = drafted["player_id"]
+                name = (players_df.loc[pid, "full_name"]
+                        if pid in players_df.index else str(pid))
+                outcome = f"became **{escape_markdown(name)}**"
+                if last is not drafted:
+                    outcome += f", now with **{team_of(last)}**"
+                else:
+                    outcome += f" ({team_of(drafted)})"
+            else:
+                outcome = f"ended up with **{team_of(last)}**"
+        blocks.append((chain.get("asset", "Asset"), lines, outcome))
+    return blocks
 
 
 def get_all_ever_rostered_ids():
@@ -3118,7 +3134,7 @@ def build_draft_day_grades(draft_id, league_id, cache_key):
     deliberately, since it also feeds Hall of Fame's Best/Worst Draft Pick
     and GM Profiles' Drafting score, and changing its meaning there wasn't
     part of this ask). `our_slot` comes from get_exact_draft_slot_map_cached
-    (the same verified real-draft-order lookup the Trade Tree lineage
+    (the same verified real-draft-order lookup the Asset Trail lineage
     feature uses) since this league's rookie draft is straight-order —
     one roster keeps the same slot in every round."""
     draft_row = get_draft_row(draft_id)
@@ -4688,11 +4704,11 @@ def page_trade_center():
         "instead? Open \"How this trade aged\" under any trade."
     )
     
-    st.subheader("Trade Tree")
+    st.subheader("Asset Trail")
     st.caption(
-        "Pick any trade and see the full lineage of every asset involved — where each piece came "
-        "from before this trade, and everywhere it went after, including what a traded pick "
-        "actually turned into once it was drafted."
+        "Pick any trade and follow each asset it involved: where the piece came from before this "
+        "trade, everywhere it went after, and — for a traded pick — the actual player it turned "
+        "into once someone finally drafted it."
     )
     tree_trades = get_all_trades(synced_at)
     if tree_trades.empty:
@@ -4705,11 +4721,18 @@ def page_trade_center():
         selected_tree_label = st.selectbox("Trade", tree_labels, key="trade_tree_pick")
         seed_txn = tree_trades.iloc[tree_labels.index(selected_tree_label)]
         chains = build_trade_lineage(seed_txn, players_df, synced_at)
-        fig = render_trade_lineage_sankey(seed_txn, chains, players_df, global_team_lookup)
-        if fig is None:
-            st.info("No history before or after this trade for any of its assets yet.")
+        blocks = render_trade_lineage_timeline(chains, players_df, global_team_lookup)
+        if not blocks:
+            st.info("Every asset in this trade was acquired here and hasn't moved since — "
+                    "no trail to follow yet.")
         else:
-            st.plotly_chart(fig, use_container_width=True)
+            for asset, lines, outcome in blocks:
+                header = f"**{escape_markdown(str(asset))}**"
+                if outcome:
+                    header += f" — {outcome}"
+                st.markdown(header)
+                st.markdown("  \n".join(lines))
+                st.divider()
 
     st.divider()
 
