@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-trade-ledger-and-drafter-guard"
+APP_BUILD = "2026-08-20-trade-conclusion-layout"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -3223,11 +3223,13 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                 if (kind_, key_) in taken:
                     continue
                 taken.add((kind_, key_))
-                # trail_[0] is the piece received in this trade; the last entry is the thing
-                # held now (carrying who it came from), and anything between is how one became
-                # the other.
-                out.append({"label": trail_[-1] if len(trail_) > 1 else lbl,
-                             "from": trail_[0], "path": list(trail_[1:-1])})
+                # trail_[0] is the piece received in this trade; anything between is how one
+                # became the other. The final entry repeats the asset plus who it came from, so
+                # that counterparty is split off rather than left cluttering the asset's name.
+                tail = trail_[-1] if len(trail_) > 1 else ""
+                acquired = tail[len(lbl):].strip() if tail.startswith(lbl) else ""
+                out.append({"label": lbl, "from": trail_[0],
+                             "path": list(trail_[1:-1]), "acquired": acquired})
             return out
 
         results[owner] = {"received": received, "gave_up": gave_up,
@@ -5028,29 +5030,49 @@ def page_trade_center():
             # and the browser reused DOM nodes across reruns and kept showing pieces of the
             # trade you'd just navigated away from. A single element of fixed shape has no
             # children to leave behind, so switching trades can't leave residue.
+            def cell(text):
+                # Table cells additionally need '|' neutralized, which escape_markdown
+                # (built for inline bold/colour wrapping) doesn't handle.
+                return escape_markdown(text).replace("|", "\\|")
+
             parts = []
             for owner, info in conclusion.items():
-                parts.append(f"**{escape_markdown(name_by_owner.get(owner, str(owner)))}**")
-                gained = ", ".join(escape_markdown(r) for r in info["received"]) or "nothing recorded"
-                given = ", ".join(escape_markdown(r) for r in info["gave_up"]) or "nothing recorded"
-                parts.append(f"- Gave up ({len(info['gave_up'])}): {given}")
-                parts.append(f"- Got ({len(info['received'])}): {gained}")
+                parts.append(f"##### {escape_markdown(name_by_owner.get(owner, str(owner)))}")
+                parts.append("")
+                gained = ", ".join(cell(r) for r in info["received"]) or "—"
+                given = ", ".join(cell(r) for r in info["gave_up"]) or "—"
+                parts.append(f"| Gave up ({len(info['gave_up'])}) | Got ({len(info['received'])}) |")
+                parts.append("| :--- | :--- |")
+                parts.append(f"| {given} | {gained} |")
+                parts.append("")
+
                 if info["holding"]:
-                    parts.append(f"- **Still has ({len(info['holding'])}):**")
+                    parts.append(f"**Has today ({len(info['holding'])})**")
+                    parts.append("")
+                    parts.append("| Asset | How it traces back |")
+                    parts.append("| :--- | :--- |")
                     for h in info["holding"]:
-                        line = f"    - **{escape_markdown(h['label'])}**"
                         if h["path"] or h["from"] != h["label"]:
-                            steps = " → ".join(escape_markdown(x) for x in [h["from"]] + h["path"])
-                            line += "  \n      *via " + steps + "*"
-                        parts.append(line)
+                            steps = " → ".join(cell(x) for x in [h["from"]] + h["path"])
+                        else:
+                            steps = "straight from this trade"
+                        if h.get("acquired"):
+                            steps += f" {cell(h['acquired'])}"
+                        parts.append(f"| **{cell(h['label'])}** | {steps} |")
+                    parts.append("")
                 else:
-                    parts.append("- **Still has:** nothing left from this trade")
+                    parts.append("**Has today (0)** — nothing left from this trade")
+                    parts.append("")
+
+                footnotes = []
                 if info["lost"]:
-                    parts.append("- Dropped along the way: "
-                                  + ", ".join(escape_markdown(l["label"]) for l in info["lost"]))
+                    footnotes.append("Dropped along the way: "
+                                      + ", ".join(escape_markdown(l["label"]) for l in info["lost"]))
                 if info["moved_on"]:
-                    parts.append("- Traded on before the draft: "
-                                  + ", ".join(escape_markdown(m["label"]) for m in info["moved_on"]))
+                    footnotes.append("Traded on before the draft: "
+                                      + ", ".join(escape_markdown(m["label"]) for m in info["moved_on"]))
+                for note in footnotes:
+                    parts.append(f"*{note}*  ")
                 parts.append("")
             st.markdown("\n".join(parts))
 
