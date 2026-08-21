@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-trade-conclusion"
+APP_BUILD = "2026-08-20-offseason-labels-and-provenance"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -1859,20 +1859,49 @@ SEASON_WEEK1_THURSDAY = {
 # for that season, nothing else.
 
 
+def season_opener_date(season):
+    """The season's real Thursday-night opener. An explicit SEASON_WEEK1_THURSDAY entry wins;
+    otherwise it's derived as the Thursday after Labor Day (the first Monday of September),
+    which reproduces every verified real opener above — so a brand-new season no longer falls
+    back to a coarse Jan-1 anchor before someone remembers to add its date by hand."""
+    listed = SEASON_WEEK1_THURSDAY.get(str(season))
+    if listed:
+        return datetime.strptime(listed, "%Y-%m-%d").date()
+    labor_day = datetime(int(season), 9, 1).date()
+    while labor_day.weekday() != 0:  # 0 = Monday
+        labor_day += timedelta(days=1)
+    return labor_day + timedelta(days=3)
+
+
+def is_offseason_move(season, created_ms):
+    """Whether a transaction happened before that season's first real game. Sleeper stamps
+    offseason moves as week 1, indistinguishable from a genuine in-season week 1 trade by week
+    number alone, so this compares the real timestamp against the real opener."""
+    if created_ms is None or pd.isna(created_ms):
+        return False
+    try:
+        opener = season_opener_date(season)
+    except (TypeError, ValueError):
+        return False
+    moved = datetime.fromtimestamp(int(created_ms) / 1000, tz=timezone.utc).date()
+    return moved < opener
+
+
+def week_label(season, week, created_ms=None):
+    """"Off" for an offseason move, otherwise "Wk<n>" — offseason trades showing as "Wk1" read
+    as though they happened during the season's opening week."""
+    if is_offseason_move(season, created_ms):
+        return "Off"
+    return f"Wk{week}" if week else "Off"
+
+
 def week_end_date(season, week):
     """Approximate real-world date by which a fantasy week's games are fully
     played out (the Tuesday after that week's Monday Night Football game) —
     used only to pick the nearest real external-market snapshot for that
     week in Stock Market, not any actual scheduling logic, so being off by a
-    day or two doesn't matter. Falls back to a plain Jan-1 anchor for any
-    season missing from SEASON_WEEK1_THURSDAY (keeps this from crashing on a
-    brand-new season before its real opener date is known, at the cost of
-    coarser precision for that season only)."""
-    week1 = SEASON_WEEK1_THURSDAY.get(str(season))
-    if not week1:
-        return f"{season}-01-01"
-    anchor = datetime.strptime(week1, "%Y-%m-%d").date()
-    return (anchor + timedelta(days=5 + (int(week) - 1) * 7)).isoformat()
+    day or two doesn't matter."""
+    return (season_opener_date(season) + timedelta(days=5 + (int(week) - 1) * 7)).isoformat()
 
 
 def build_stock_market_history(cache_key):
@@ -2813,6 +2842,7 @@ def get_player_event_history(player_id):
                 events.append({"season": row["season"], "league_id": lid, "week": txn["week"],
                                 "type": txn["type"], "roster_id": adds[player_id],
                                 "transaction_id": txn["transaction_id"], "draft_id": None,
+                                "created": txn["created"],
                                 "order": (row["season"], txn["created"])})
     events.sort(key=lambda e: e["order"])
     return events
@@ -2833,7 +2863,8 @@ def event_label(event, global_team_lookup, players_df):
         who = f" {escape_markdown(name)}" if name else ""
         return f"{event['season']} Draft{who} → {team}"
     if event["week"]:
-        return f"{event['season']} Wk{event['week']} {event['type'].replace('_', ' ').title()} → {team}"
+        stamp = week_label(event["season"], event["week"], event.get("created"))
+        return f"{event['season']} {stamp} {event['type'].replace('_', ' ').title()} → {team}"
     return f"{event['season']} {event['type'].replace('_', ' ').title()} → {team}"
 
 
@@ -2885,7 +2916,7 @@ def trace_pick_forward(pick_season, pick_round, original_roster_id, seed_created
             break
         hop_row = later.iloc[0]
         fake_event = {"season": hop_row["trade_season"], "league_id": hop_row["league_id"],
-                      "week": hop_row["trade_week"], "type": "trade",
+                      "week": hop_row["trade_week"], "type": "trade", "created": hop_row["created"],
                       "roster_id": hop_row["owner_id"], "transaction_id": hop_row["transaction_id"], "draft_id": None}
         hops.append({"event": fake_event, "asset_label": pick_label})
         cursor = hop_row["created"]
@@ -2922,7 +2953,7 @@ def trace_pick_backward(pick_season, pick_round, original_roster_id, seed_create
             break
         hop_row = earlier.iloc[0]
         fake_event = {"season": hop_row["trade_season"], "league_id": hop_row["league_id"],
-                      "week": hop_row["trade_week"], "type": "trade",
+                      "week": hop_row["trade_week"], "type": "trade", "created": hop_row["created"],
                       "roster_id": hop_row["previous_owner_id"], "transaction_id": hop_row["transaction_id"],
                       "draft_id": None}
         hops.append({"event": fake_event, "asset_label": pick_label})
@@ -3007,6 +3038,21 @@ def _receipts_for_roster(txn_row, roster_id):
     return players, picks
 
 
+def _trade_step_label(txn_row, my_roster_id, global_team_lookup):
+    """" (from <other team>)" for a trade, so a breadcrumb reads like the way someone would
+    actually recount it — "that pick became X, who I sent to Y for Z"."""
+    others = set()
+    for pid, rid in (parse_json_field(txn_row["adds"], {}) or {}).items():
+        if int(rid) != int(my_roster_id):
+            others.add(int(rid))
+    for pid, rid in (parse_json_field(txn_row["drops"], {}) or {}).items():
+        if int(rid) != int(my_roster_id):
+            others.add(int(rid))
+    names = [str(global_team_lookup.get((txn_row["league_id"], rid), "")).strip() for rid in others]
+    names = [n for n in names if n]
+    return f" (from {names[0]})" if len(names) == 1 else ""
+
+
 def build_trade_conclusion(seed_txn, players_df, cache_key):
     """What each side of a trade actually has to show for it TODAY.
 
@@ -3059,13 +3105,15 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
         recv_players, recv_picks = _receipts_for_roster(seed_txn, rid)
         received = [label_player(p) for p in recv_players] + [label_pick(k) for k in recv_picks]
 
-        queue = ([("player", p, seed_created) for p in recv_players]
-                 + [("pick", k, seed_created) for k in recv_picks])
+        # Each queue item carries the breadcrumb of how it descends from this trade, so a
+        # holding several moves removed can explain itself instead of appearing out of nowhere.
+        queue = ([("player", p, seed_created, (label_player(p),)) for p in recv_players]
+                 + [("pick", k, seed_created, (label_pick(k),)) for k in recv_picks])
         seen, holding, lost = set(), [], []
         steps = 0
         while queue and steps < TRADE_CONCLUSION_MAX_STEPS:
             steps += 1
-            kind, key, since = queue.pop(0)
+            kind, key, since, trail = queue.pop(0)
             if (kind, key) in seen:
                 continue
             seen.add((kind, key))
@@ -3081,15 +3129,18 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                         gone = t
                         break
                 if gone is None:
-                    holding.append(("player", key, label_player(key)))
+                    holding.append(("player", key, label_player(key), trail))
                     continue
                 if gone["type"] == "trade":
                     my_rid = roster_of.get((owner, gone["league_id"]))
                     got_players, got_picks = _receipts_for_roster(gone, my_rid)
-                    queue += [("player", p, gone["created"]) for p in got_players]
-                    queue += [("pick", k, gone["created"]) for k in got_picks]
+                    step = _trade_step_label(gone, my_rid, global_team_lookup)
+                    queue += [("player", p, gone["created"], trail + (f"{label_player(p)}{step}",))
+                              for p in got_players]
+                    queue += [("pick", k, gone["created"], trail + (f"{label_pick(k)}{step}",))
+                              for k in got_picks]
                 else:
-                    lost.append(("player", key, label_player(key)))
+                    lost.append(("player", key, label_player(key), trail))
                 continue
 
             season, rnd, orig = key
@@ -3109,8 +3160,11 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                     row = parent.iloc[0]
                     my_rid = roster_of.get((owner, row["league_id"]))
                     got_players, got_picks = _receipts_for_roster(row, my_rid)
-                    queue += [("player", p, row["created"]) for p in got_players]
-                    queue += [("pick", k, row["created"]) for k in got_picks]
+                    step = _trade_step_label(row, my_rid, global_team_lookup)
+                    queue += [("player", p, row["created"], trail + (f"{label_player(p)}{step}",))
+                              for p in got_players]
+                    queue += [("pick", k, row["created"], trail + (f"{label_pick(k)}{step}",))
+                              for k in got_picks]
                 continue
 
             drafted = resolve_pick_to_player(season, rnd, orig, cache_key)
@@ -3125,18 +3179,23 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                         stamp = drow.iloc[0]["last_picked"] or drow.iloc[0]["start_time"]
                         if pd.notna(stamp):
                             draft_time = max(since, int(stamp))
-                queue.append(("player", drafted, draft_time))
+                queue.append(("player", drafted, draft_time,
+                               trail + (f"drafted {label_player(drafted)}",)))
             else:
-                holding.append(("pick", key, label_pick(key)))
+                holding.append(("pick", key, label_pick(key), trail))
 
         # de-duplicate while preserving order
         def dedupe(items):
             out, taken = [], set()
-            for kind_, key_, lbl in items:
+            for kind_, key_, lbl, trail_ in items:
                 if (kind_, key_) in taken:
                     continue
                 taken.add((kind_, key_))
-                out.append(lbl)
+                # trail_[0] is the piece received in this trade; the last entry is the thing
+                # held now (carrying who it came from), and anything between is how one became
+                # the other.
+                out.append({"label": trail_[-1] if len(trail_) > 1 else lbl,
+                             "from": trail_[0], "path": list(trail_[1:-1])})
             return out
 
         results[owner] = {"received": received, "holding": dedupe(holding), "lost": dedupe(lost)}
@@ -4599,7 +4658,8 @@ def page_recent_transactions():
         st.info("No transactions recorded yet.")
     else:
         for _, txn in transactions.iterrows():
-            st.subheader(f"{txn['type'].replace('_', ' ').title()} — Week {txn['week']}")
+            st.subheader(f"{txn['type'].replace('_', ' ').title()} — "
+                          f"{week_label(season_choice, txn['week'], txn.get('created'))}")
             for name, team in format_player_moves(txn["adds"], players_df, team_lookup):
                 st.write(f"Added: {name} ({team})")
             for name, team in format_player_moves(txn["drops"], players_df, team_lookup):
@@ -4912,7 +4972,8 @@ def page_trade_center():
         tree_labels = []
         for _, t in tree_trades.iterrows():
             summary = " / ".join(describe_trade(t, players_df, t["league_id"], global_team_lookup))
-            tree_labels.append(f"{t['season']} Wk{t['week']}: {summary}"[:120])
+            stamp = week_label(t["season"], t["week"], t.get("created"))
+            tree_labels.append(f"{t['season']} {stamp}: {summary}"[:120])
         selected_tree_label = st.selectbox("Trade", tree_labels, key="trade_tree_pick")
         seed_txn = tree_trades.iloc[tree_labels.index(selected_tree_label)]
 
@@ -4935,13 +4996,17 @@ def page_trade_center():
                     st.caption("Got: " + (", ".join(escape_markdown(r) for r in info["received"])
                                            or "nothing recorded"))
                     if info["holding"]:
-                        st.markdown("**Still has:**  \n"
-                                     + "  \n".join(f"• {escape_markdown(h)}" for h in info["holding"]))
+                        st.markdown("**Still has:**")
+                        for h in info["holding"]:
+                            st.markdown(f"• **{escape_markdown(h['label'])}**")
+                            if h["path"] or h["from"] != h["label"]:
+                                steps = [h["from"]] + h["path"]
+                                st.caption("via " + " → ".join(escape_markdown(s) for s in steps))
                     else:
                         st.markdown("**Still has:** nothing left from this trade")
                     if info["lost"]:
                         st.caption("Dropped along the way: "
-                                    + ", ".join(escape_markdown(l) for l in info["lost"]))
+                                    + ", ".join(escape_markdown(l["label"]) for l in info["lost"]))
 
         with st.expander("Full asset-by-asset trail"):
             chains = build_trade_lineage(seed_txn, players_df, synced_at)
@@ -4989,7 +5054,7 @@ def page_trade_center():
                                  cache_key=synced_at)
             trade_league_grades = get_league_grades(txn["league_id"], int(txn["season"]), synced_at)
 
-            st.write(f"**{txn['season']} — Week {txn['week']}**")
+            st.write(f"**{txn['season']} — {week_label(txn['season'], txn['week'], txn.get('created'))}**")
             for line in describe_trade(txn, players_df, txn["league_id"], global_team_lookup):
                 st.write(line)
 
