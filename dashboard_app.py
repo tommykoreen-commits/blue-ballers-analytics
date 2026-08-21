@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-future-picks-in-grades"
+APP_BUILD = "2026-08-20-bench-depth-grade"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -1982,8 +1982,11 @@ FUTURE_CORE_PLAYERS = 15  # how deep "future value" counts: roughly a full start
 # immediate backups. Summing value across the WHOLE roster instead graded roster QUANTITY —
 # a team carrying 31 middling players outscored a top-heavy contender and landed a C while the
 # league's strongest roster got a D, because a superstar counted the same as two spare parts.
-BENCH_DEPTH_PLAYERS = 5  # how many of the best non-starters the bench grade reflects, for the
-# same reason: depth means having good replacements, not merely having many bodies.
+# Bench depth is graded on how much of its best lineup a roster RETAINS once byes and injuries
+# are simulated, not on the raw point total of its top few reserves. Those are very different
+# things: a roster can carry a pile of useful-looking backups at one position and still collapse,
+# because a spare receiver cannot fill a running back slot and the drop-off behind a star is what
+# actually costs points. Retention measures the insulation itself.
 CONTEND_WEIGHT = 0.5  # split between win-now strength and future value in the overall grade.
 
 
@@ -2012,12 +2015,12 @@ def build_league_grades(league_id, value_table, standings, season_year=None, cac
             proj["nfl_team_of"], rng)
         metrics["contender_score"] = contend
 
-        starting = optimal_lineup_picks(proj["roster_positions"], entries)
-        starting_ids = {e[2] for e in starting}
+        healthy = compute_optimal_lineup_score(proj["roster_positions"], entries)
         metrics["starter_value"] = contend
-        metrics["bench_value"] = sum(
-            sorted((e[0] for e in entries if e[2] not in starting_ids), reverse=True
-                   )[:BENCH_DEPTH_PLAYERS])
+        metrics["healthy_lineup"] = healthy
+        # Share of its best lineup this roster keeps once byes/injuries are simulated. See the
+        # BENCH_DEPTH note above for why this, and not a sum of the top few reserves.
+        metrics["bench_value"] = (contend / healthy) if healthy else 0.0
 
         team_values = value_table.loc[value_table.index.intersection(player_ids)]
         youth_adjusted = team_values["value"] * (
