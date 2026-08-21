@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-asset-trail"
+APP_BUILD = "2026-08-20-trade-conclusion"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -2734,34 +2734,47 @@ def get_exact_draft_slot_map_cached(league_id, cache_key):
 
 
 def resolve_pick_to_player(pick_season, pick_round, original_roster_id, cache_key):
-    """The real player a specific (season, round, original-owner) pick turned into
-    — None if that season's rookie draft hasn't happened/been synced yet (a still-
-    future pick). Slot is derived from the ORIGINAL owner's real finish that season,
-    since that's what determines the numbered pick regardless of who ultimately
-    used it to draft."""
+    """The real player a specific (season, round, original-owner) pick turned into — None if
+    that draft hasn't happened/been synced yet (a still-future pick).
+
+    Slot comes from Sleeper's own `drafts.draft_order` (user_id -> real slot), keyed to the
+    ORIGINAL owner since that's what fixes the numbered pick regardless of who ultimately used
+    it. That's the authoritative order, and it needs no simulation: the previous approach
+    replayed the pick season's standings to infer slots, which also meant it refused to resolve
+    anything until that season was fully complete — wrong for a draft held BEFORE its season is
+    played (a draft's order comes from the season before it), so picks already spent in the
+    current season's completed rookie draft resolved to nothing and looked unused."""
     season_row = load_table("SELECT league_id FROM league_seasons WHERE season = ?", params=(pick_season,))
     if season_row.empty:
         return None
     lid = season_row.iloc[0]["league_id"]
-    playoff_settings = get_playoff_settings(lid)
-    last_completed = get_last_completed_week(lid)
-    # >=, not == : real-NFL week 18 data can leak into matchups even though this
-    # league's fantasy season ends at round2_weeks[1] (the same leakage Hall of
-    # Fame's weekly-score records had to guard against) — requiring exact equality
-    # meant a fully-complete season NEVER matched and every pick silently failed
-    # to resolve.
-    if last_completed is None or last_completed < playoff_settings["round2_weeks"][1]:
-        return None  # season not fully complete yet — no exact slot to resolve
-    rookie_drafts = get_rookie_draft_list(cache_key)
-    draft_row = rookie_drafts[rookie_drafts["league_id"] == lid]
+    draft_row = load_table(
+        "SELECT draft_id, draft_order, type FROM drafts WHERE league_id = ?", params=(lid,))
     if draft_row.empty:
         return None
     draft_id = draft_row.iloc[0]["draft_id"]
-    slot_map = get_exact_draft_slot_map_cached(lid, cache_key)
-    slot = slot_map.get(int(original_roster_id))
+    draft_order = parse_json_field(draft_row.iloc[0]["draft_order"], {}) or {}
+    if not draft_order:
+        return None
+
+    owner_row = load_table(
+        "SELECT owner_id FROM rosters WHERE league_id = ? AND roster_id = ?",
+        params=(lid, int(original_roster_id)))
+    if owner_row.empty:
+        return None
+    slot = draft_order.get(str(owner_row.iloc[0]["owner_id"]))
     if slot is None:
         return None
-    pick_no = (int(pick_round) - 1) * 8 + slot
+
+    teams = len(draft_order)
+    round_no = int(pick_round)
+    # Snake drafts reverse every even round; linear ones keep the same order throughout.
+    if str(draft_row.iloc[0]["type"]).lower() == "snake" and round_no % 2 == 0:
+        slot_in_round = teams + 1 - int(slot)
+    else:
+        slot_in_round = int(slot)
+    pick_no = (round_no - 1) * teams + slot_in_round
+
     result = load_table("SELECT player_id FROM draft_picks WHERE draft_id = ? AND pick_no = ?",
                          params=(draft_id, pick_no))
     return result.iloc[0]["player_id"] if not result.empty else None
@@ -2946,6 +2959,188 @@ def build_trade_lineage(seed_txn, players_df, cache_key):
                                            pick_events_df, players_df, cache_key),
         })
     return chains
+
+
+TRADE_CONCLUSION_MAX_STEPS = 80  # safety cap on the consequence walk per side of a trade
+
+
+@st.cache_data(ttl=1800)
+def get_all_transactions_detail(cache_key):
+    """Every transaction across every synced season with the fields needed to follow an asset
+    out of a roster and see what came back in its place."""
+    frames = []
+    for _, srow in load_table("SELECT league_id, season FROM league_seasons").iterrows():
+        df = load_table(
+            "SELECT transaction_id, week, type, adds, drops, draft_picks, created "
+            "FROM transactions WHERE league_id = ?", params=(srow["league_id"],))
+        if df.empty:
+            continue
+        df["league_id"] = srow["league_id"]
+        df["season"] = srow["season"]
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame(columns=["transaction_id", "week", "type", "adds", "drops",
+                                      "draft_picks", "created", "league_id", "season"])
+    return pd.concat(frames, ignore_index=True).sort_values("created")
+
+
+@st.cache_data(ttl=1800)
+def get_owner_roster_maps(cache_key):
+    """(league_id, roster_id) -> owner_id and (owner_id, league_id) -> roster_id. A manager's
+    roster_id is per-season, so following one manager's assets across seasons has to hop
+    through owner_id rather than assuming a stable roster_id."""
+    df = load_table("SELECT league_id, roster_id, owner_id FROM rosters")
+    owner_of, roster_of = {}, {}
+    for _, r in df.iterrows():
+        owner_of[(r["league_id"], int(r["roster_id"]))] = r["owner_id"]
+        roster_of[(r["owner_id"], r["league_id"])] = int(r["roster_id"])
+    return owner_of, roster_of
+
+
+def _receipts_for_roster(txn_row, roster_id):
+    """(player_ids, pick_keys) one roster RECEIVED in a single transaction."""
+    adds = parse_json_field(txn_row["adds"], {}) or {}
+    players = [pid for pid, rid in adds.items() if int(rid) == int(roster_id)]
+    picks = [(p.get("season"), p.get("round"), p.get("roster_id"))
+             for p in (parse_json_field(txn_row["draft_picks"], []) or [])
+             if p.get("owner_id") is not None and int(p["owner_id"]) == int(roster_id)]
+    return players, picks
+
+
+def build_trade_conclusion(seed_txn, players_df, cache_key):
+    """What each side of a trade actually has to show for it TODAY.
+
+    Follows every asset a manager received forward through their own later moves: when an asset
+    was traded on, whatever came back in that trade becomes its descendant and the walk
+    continues; when a pick was finally used, the drafted player takes over the chain; when an
+    asset was simply dropped, that branch ends as a loss. What survives is the manager's
+    current holdings that trace back to this trade.
+
+    One honest caveat, unavoidable in any trade tree: when several assets leave in a single
+    trade, the return can't be attributed to one of them in particular, so it's credited to
+    each outgoing piece. Descendants are de-duplicated per side, so nothing is double-counted
+    in the result itself.
+
+    Returns {owner_id: {"received": [...], "holding": [...], "lost": [...]}}."""
+    txns = get_all_transactions_detail(cache_key)
+    pick_events = get_all_pick_trade_events(cache_key)
+    owner_of, roster_of = get_owner_roster_maps(cache_key)
+    season_league = dict(zip(
+        load_table("SELECT season, league_id FROM league_seasons")["season"],
+        load_table("SELECT season, league_id FROM league_seasons")["league_id"]))
+
+    seed_lid = seed_txn["league_id"]
+    seed_created = seed_txn["created"]
+    seed_adds = parse_json_field(seed_txn["adds"], {}) or {}
+    seed_picks = parse_json_field(seed_txn["draft_picks"], []) or []
+
+    sides = {int(rid) for rid in seed_adds.values()}
+    sides |= {int(p["owner_id"]) for p in seed_picks if p.get("owner_id") is not None}
+
+    def label_player(pid):
+        return str(players_df.loc[pid, "full_name"]) if pid in players_df.index else str(pid)
+
+    global_team_lookup = get_global_team_lookup()
+
+    def label_pick(key):
+        # Original owner included because a manager can hold two different picks of the same
+        # season and round; without it they render as one repeated line.
+        season, rnd, orig = key
+        lid_for_pick = season_league.get(str(season), seed_lid)
+        team = global_team_lookup.get((lid_for_pick, orig)) or global_team_lookup.get((seed_lid, orig))
+        whose = f" ({str(team).strip()}'s)" if team else ""
+        return f"{season} {ordinal(rnd)}{whose}"
+
+    results = {}
+    for rid in sides:
+        owner = owner_of.get((seed_lid, rid))
+        if owner is None:
+            continue
+        recv_players, recv_picks = _receipts_for_roster(seed_txn, rid)
+        received = [label_player(p) for p in recv_players] + [label_pick(k) for k in recv_picks]
+
+        queue = ([("player", p, seed_created) for p in recv_players]
+                 + [("pick", k, seed_created) for k in recv_picks])
+        seen, holding, lost = set(), [], []
+        steps = 0
+        while queue and steps < TRADE_CONCLUSION_MAX_STEPS:
+            steps += 1
+            kind, key, since = queue.pop(0)
+            if (kind, key) in seen:
+                continue
+            seen.add((kind, key))
+
+            if kind == "player":
+                gone = None
+                for _, t in txns[txns["created"] > since].iterrows():
+                    my_rid = roster_of.get((owner, t["league_id"]))
+                    if my_rid is None:
+                        continue
+                    drops = parse_json_field(t["drops"], {}) or {}
+                    if key in drops and int(drops[key]) == int(my_rid):
+                        gone = t
+                        break
+                if gone is None:
+                    holding.append(("player", key, label_player(key)))
+                    continue
+                if gone["type"] == "trade":
+                    my_rid = roster_of.get((owner, gone["league_id"]))
+                    got_players, got_picks = _receipts_for_roster(gone, my_rid)
+                    queue += [("player", p, gone["created"]) for p in got_players]
+                    queue += [("pick", k, gone["created"]) for k in got_picks]
+                else:
+                    lost.append(("player", key, label_player(key)))
+                continue
+
+            season, rnd, orig = key
+            mine = pick_events[(pick_events["pick_season"] == season)
+                                & (pick_events["pick_round"] == rnd)
+                                & (pick_events["original_roster_id"] == orig)
+                                & (pick_events["created"] > since)].sort_values("created")
+            traded_on = None
+            for _, ev in mine.iterrows():
+                my_rid = roster_of.get((owner, ev["league_id"]))
+                if my_rid is not None and int(ev["previous_owner_id"]) == int(my_rid):
+                    traded_on = ev
+                    break
+            if traded_on is not None:
+                parent = txns[txns["transaction_id"] == traded_on["transaction_id"]]
+                if not parent.empty:
+                    row = parent.iloc[0]
+                    my_rid = roster_of.get((owner, row["league_id"]))
+                    got_players, got_picks = _receipts_for_roster(row, my_rid)
+                    queue += [("player", p, row["created"]) for p in got_players]
+                    queue += [("pick", k, row["created"]) for k in got_picks]
+                continue
+
+            drafted = resolve_pick_to_player(season, rnd, orig, cache_key)
+            if drafted:
+                pick_lid = season_league.get(str(season))
+                draft_time = since
+                if pick_lid:
+                    drow = load_table(
+                        "SELECT last_picked, start_time FROM drafts WHERE league_id = ?",
+                        params=(pick_lid,))
+                    if not drow.empty:
+                        stamp = drow.iloc[0]["last_picked"] or drow.iloc[0]["start_time"]
+                        if pd.notna(stamp):
+                            draft_time = max(since, int(stamp))
+                queue.append(("player", drafted, draft_time))
+            else:
+                holding.append(("pick", key, label_pick(key)))
+
+        # de-duplicate while preserving order
+        def dedupe(items):
+            out, taken = [], set()
+            for kind_, key_, lbl in items:
+                if (kind_, key_) in taken:
+                    continue
+                taken.add((kind_, key_))
+                out.append(lbl)
+            return out
+
+        results[owner] = {"received": received, "holding": dedupe(holding), "lost": dedupe(lost)}
+    return results
 
 
 def render_trade_lineage_timeline(chains, players_df, global_team_lookup):
@@ -4720,19 +4915,48 @@ def page_trade_center():
             tree_labels.append(f"{t['season']} Wk{t['week']}: {summary}"[:120])
         selected_tree_label = st.selectbox("Trade", tree_labels, key="trade_tree_pick")
         seed_txn = tree_trades.iloc[tree_labels.index(selected_tree_label)]
-        chains = build_trade_lineage(seed_txn, players_df, synced_at)
-        blocks = render_trade_lineage_timeline(chains, players_df, global_team_lookup)
-        if not blocks:
-            st.info("Every asset in this trade was acquired here and hasn't moved since — "
-                    "no trail to follow yet.")
+
+        st.markdown("##### Where it stands today")
+        st.caption(
+            "Each side's current holdings that trace back to this trade — following every piece "
+            "through the moves that came after it, so a player later flipped for someone else "
+            "shows up as whoever is on the roster now. When several assets left in one trade the "
+            "return can't be pinned to just one of them, so it's credited to each."
+        )
+        conclusion = build_trade_conclusion(seed_txn, players_df, synced_at)
+        name_by_owner = get_manager_name_lookup()
+        if not conclusion:
+            st.info("Couldn't resolve the sides of this trade.")
         else:
-            for asset, lines, outcome in blocks:
-                header = f"**{escape_markdown(str(asset))}**"
-                if outcome:
-                    header += f" — {outcome}"
-                st.markdown(header)
-                st.markdown("  \n".join(lines))
-                st.divider()
+            cols = st.columns(len(conclusion))
+            for col, (owner, info) in zip(cols, conclusion.items()):
+                with col:
+                    st.markdown(f"**{escape_markdown(name_by_owner.get(owner, str(owner)))}**")
+                    st.caption("Got: " + (", ".join(escape_markdown(r) for r in info["received"])
+                                           or "nothing recorded"))
+                    if info["holding"]:
+                        st.markdown("**Still has:**  \n"
+                                     + "  \n".join(f"• {escape_markdown(h)}" for h in info["holding"]))
+                    else:
+                        st.markdown("**Still has:** nothing left from this trade")
+                    if info["lost"]:
+                        st.caption("Dropped along the way: "
+                                    + ", ".join(escape_markdown(l) for l in info["lost"]))
+
+        with st.expander("Full asset-by-asset trail"):
+            chains = build_trade_lineage(seed_txn, players_df, synced_at)
+            blocks = render_trade_lineage_timeline(chains, players_df, global_team_lookup)
+            if not blocks:
+                st.info("Every asset in this trade was acquired here and hasn't moved since — "
+                        "no trail to follow yet.")
+            else:
+                for asset, lines, outcome in blocks:
+                    header = f"**{escape_markdown(str(asset))}**"
+                    if outcome:
+                        header += f" — {outcome}"
+                    st.markdown(header)
+                    st.markdown("  \n".join(lines))
+                    st.divider()
 
     st.divider()
 
