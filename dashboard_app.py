@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-trade-value-cell-fix"
+APP_BUILD = "2026-08-20-fix-reacquired-hop"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -3309,6 +3309,11 @@ def render_trade_lineage_timeline(chains, players_df, global_team_lookup):
         for phase, hop in ordered:
             if phase == "after" and not any(l.startswith("**◆") for l in lines):
                 lines.append("**◆ this trade**")
+                # The seed trade is itself a change of hands, so the next event must render even
+                # if it returns the asset to whoever held it before. Without this reset, an
+                # asset traded away and later reacquired lost the hop back: it matched the
+                # previously-shown holder and got collapsed as a no-op.
+                last_holder = None
             event = hop["event"]
             holder = (event["league_id"], event["roster_id"])
             # Collapse consecutive events that leave the asset with the same team (a drop and
