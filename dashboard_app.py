@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-team-grades-rework"
+APP_BUILD = "2026-08-20-future-picks-in-grades"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -1949,6 +1949,35 @@ def style_grades(df, columns):
     return df.style.map(_color, subset=columns)
 
 
+def build_asset_worth_curve(cache_key, as_of_date=None):
+    """Sorted array of real market values (FantasyCalc's own numbers, players and picks
+    pooled), used to turn a 0-100 consensus PERCENTILE back into something proportional to
+    real worth before assets get added together.
+
+    Percentiles must never be summed directly: they rank, they don't measure. On the pooled
+    distribution a near-worthless 4th-round rookie pick still lands around the 60th percentile
+    simply by outranking thousands of irrelevant players, so adding up a dozen of them
+    manufactured a fortune out of junk. Mapping each percentile back onto the real value
+    distribution fixes that using actual market data, rather than a hand-picked curve — the
+    real curve is flatter at the very top and steeper through the middle than any simple
+    exponent reproduces (checked against the live snapshots)."""
+    player_df = get_external_player_snapshots(cache_key)
+    pick_df = get_external_pick_snapshots(cache_key)
+    pools, _players, _picks = _external_source_pools(player_df, pick_df, as_of_date)
+    for source in ("fantasycalc", "dynastyprocess_value"):
+        pool = pools.get(source)
+        if pool is not None and len(pool):
+            return np.asarray(pool, dtype=float)
+    return None
+
+
+def asset_worth(percentile, worth_curve):
+    """One asset's approximate real market value, from its 0-100 consensus percentile."""
+    if worth_curve is None or not len(worth_curve):
+        return float(percentile)
+    return float(np.quantile(worth_curve, min(max(percentile, 0.0), 100.0) / 100.0))
+
+
 FUTURE_CORE_PLAYERS = 15  # how deep "future value" counts: roughly a full starting lineup plus
 # immediate backups. Summing value across the WHOLE roster instead graded roster QUANTITY —
 # a team carrying 31 middling players outscored a top-heavy contender and landed a C while the
@@ -1958,13 +1987,17 @@ BENCH_DEPTH_PLAYERS = 5  # how many of the best non-starters the bench grade ref
 CONTEND_WEIGHT = 0.5  # split between win-now strength and future value in the overall grade.
 
 
-def build_league_grades(league_id, value_table, standings):
+def build_league_grades(league_id, value_table, standings, season_year=None, cache_key=None):
     """Team grades from two real, separately-graded halves: win-now strength (the projected
     starting lineup, depth-discounted — the same projection behind Power Rankings and
     championship odds, so a team's grade can't contradict its odds) and future value
-    (youth-adjusted market value of its core, not a headcount of its whole roster)."""
+    (youth-adjusted market value of its core PLUS the real market value of the future draft
+    picks it owns, since in a dynasty league picks are a large part of what a rebuilding team
+    is actually holding — grading future value off rostered players alone badly understates
+    exactly the teams whose future IS their pick stash)."""
     proj = build_projection_inputs(league_id)
     rng = np.random.default_rng(DEPTH_SIM_SEED)
+    worth_curve = build_asset_worth_curve(cache_key) if cache_key is not None else None
 
     records = []
     for _, row in standings.iterrows():
@@ -1989,10 +2022,30 @@ def build_league_grades(league_id, value_table, standings):
         team_values = value_table.loc[value_table.index.intersection(player_ids)]
         youth_adjusted = team_values["value"] * (
             1 + (27 - team_values["age"].fillna(27)).clip(lower=0) * 0.03)
-        metrics["future_score"] = float(youth_adjusted.nlargest(FUTURE_CORE_PLAYERS).sum())
+        metrics["core_value"] = float(sum(
+            asset_worth(v, worth_curve) for v in youth_adjusted.nlargest(FUTURE_CORE_PLAYERS)))
         records.append(metrics)
 
     league_df = pd.DataFrame(records).set_index("roster_id")
+
+    # Future draft capital, valued on the same 0-100 market scale as players so the two add up.
+    # Each pick is priced off how strong the team it originally belongs to projects to be
+    # (a rebuilding team's own first is worth far more than a contender's), using this
+    # league's own projected strength rather than a second, separate power model.
+    contend_pct_for_picks = league_df["contender_score"].rank(pct=True).to_dict()
+    pick_capital = {rid: 0.0 for rid in league_df.index}
+    if season_year is not None:
+        inventory = build_pick_inventory(league_id, season_year, standings)
+        for _, pick in inventory.iterrows():
+            owner = int(pick["owner_roster_id"])
+            if owner not in pick_capital:
+                continue
+            pick_capital[owner] += asset_worth(pick_value(
+                int(pick["round"]),
+                contend_pct_for_picks.get(int(pick["original_roster_id"]), 0.5),
+                season=pick["season"], cache_key=cache_key), worth_curve)
+    league_df["pick_capital"] = pd.Series(pick_capital)
+    league_df["future_score"] = league_df["core_value"] + league_df["pick_capital"]
 
     contend_std = league_df["contender_score"].std(ddof=0)
     future_std = league_df["future_score"].std(ddof=0)
@@ -2014,7 +2067,8 @@ def build_league_grades(league_id, value_table, standings):
 def get_league_grades(league_id, season_year, cache_key):
     value_table = get_value_table(league_id, season_year, cache_key)
     standings_local = get_standings(league_id)
-    return build_league_grades(league_id, value_table, standings_local)
+    return build_league_grades(league_id, value_table, standings_local,
+                                season_year=season_year, cache_key=cache_key)
 
 
 def build_positional_grades(league_id, value_table, standings):
@@ -2207,7 +2261,12 @@ def pick_value(round_no, original_roster_power_percentile, slot_distribution=Non
 
     if slot_distribution:
         return round(sum(p * slot_value(slot) for slot, p in enumerate(slot_distribution, start=1)), 1)
-    estimated_slot = 1 + (1 - original_roster_power_percentile) * 7
+    # Slot 1 is the EARLIEST, most valuable pick, and in this league the weakest teams pick
+    # first (non-playoff teams take 1-4 by lowest Max PF). So a low power percentile has to map
+    # to a low slot number: pct 0 -> slot 1, pct 1 -> slot 8. This previously read
+    # `1 + (1 - pct) * 7`, which inverted it -- pricing a contender's future first-rounder as
+    # the 1.01 and a rebuilding team's as a late pick, the exact opposite of reality.
+    estimated_slot = 1 + original_roster_power_percentile * 7
     return round(slot_value(estimated_slot), 1)
 
 
@@ -4379,7 +4438,15 @@ def page_team_pages():
     # two on a different (better) basis than team_overview_metrics' raw sums, and showing one
     # number next to a rank derived from the other would contradict itself.
     c3.metric("Contender Score", f"{grade_row['contender_score']:.0f}", f"#{contender_rank} of {n_teams}")
-    c4.metric("Future Score", f"{grade_row['future_score']:.0f}", f"#{future_rank} of {n_teams}")
+    c4.metric("Future Score", f"{grade_row['future_score']:,.0f}", f"#{future_rank} of {n_teams}")
+    st.caption(
+        "Contender Score is projected points per week from the best lineup this roster can "
+        "field, after discounting for byes and injury risk. Future Score is real market value "
+        "of the roster core plus every future draft pick it owns — picks are a real part of a "
+        "dynasty team's future, and a rebuilding team's own first is worth more than a "
+        "contender's. The Overall grade blends the two and is graded on how far a team sits "
+        "from the league average, so a genuine gap shows up as a real grade gap."
+    )
 
     c5, c6, c7 = st.columns(3)
     avg_age = metrics["avg_age"]
