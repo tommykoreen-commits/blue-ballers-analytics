@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-fix-reacquired-hop"
+APP_BUILD = "2026-08-20-trade-grade-real-worth"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -2481,6 +2481,12 @@ def grade_trade(txn, value_table, power_pct, global_team_lookup, league_id, cach
     drops = parse_json_field(txn["drops"], {})
     draft_picks = parse_json_field(txn["draft_picks"], [])
     waiver_budget = parse_json_field(txn["waiver_budget"], [])
+    # Consensus values are PERCENTILES, which rank rather than measure, so they're mapped onto
+    # the real market distribution before any addition. Summing them directly made the side
+    # receiving MORE PIECES win almost automatically: four assets averaging the 87th percentile
+    # totalled far more than three averaging the 94th, which is how a trade sending away the
+    # single best player in it came out an A.
+    worth_curve = build_asset_worth_curve(cache_key, as_of_date=season_end_as_of_date(txn["season"]))         if cache_key else None
 
     received = {rid: 0.0 for rid in roster_ids}
     given = {rid: 0.0 for rid in roster_ids}
@@ -2490,8 +2496,8 @@ def grade_trade(txn, value_table, power_pct, global_team_lookup, league_id, cach
     def player_value_and_age(player_id):
         if player_id in value_table.index:
             row = value_table.loc[player_id]
-            return row["value"], row["age"]
-        return 20.0, None  # unrostered/unknown player — small flat fallback
+            return asset_worth(float(row["value"]), worth_curve), row["age"]
+        return asset_worth(20.0, worth_curve), None  # unrostered/unknown — small flat fallback
 
     for player_id, roster_id in adds.items():
         if roster_id in received:
@@ -2506,8 +2512,10 @@ def grade_trade(txn, value_table, power_pct, global_team_lookup, league_id, cach
             future_given[roster_id] += future_weighted_value(val, age)
 
     for pick in draft_picks:
-        val = pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5), season=pick.get("season"),
-                          cache_key=cache_key, as_of_date=season_end_as_of_date(txn["season"]) if cache_key else None)
+        val = asset_worth(
+            pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5), season=pick.get("season"),
+                        cache_key=cache_key, as_of_date=season_end_as_of_date(txn["season"]) if cache_key else None),
+            worth_curve)
         new_owner, prev_owner = pick.get("owner_id"), pick.get("previous_owner_id")
         if new_owner in received:
             received[new_owner] += val
@@ -2517,7 +2525,9 @@ def grade_trade(txn, value_table, power_pct, global_team_lookup, league_id, cach
             future_given[prev_owner] += val * 1.3
 
     for wb in waiver_budget:
-        faab_val = wb.get("amount", 0) * 0.3
+        # FAAB is denominated in dollars, not percentiles, so it needs its own scaling onto the
+        # worth scale rather than the old flat 0.3-per-dollar (which was tuned for percentiles).
+        faab_val = asset_worth(min(wb.get("amount", 0) * 0.3, 100.0), worth_curve)
         receiver, sender = wb.get("receiver"), wb.get("sender")
         if receiver in received:
             received[receiver] += faab_val
@@ -2600,20 +2610,33 @@ def build_trade_aging_detail(txn, power_pct, players_df, cache_key):
     return pd.DataFrame(rows)
 
 
-CONTEXT_FIT_THRESHOLD = 10.0  # ignore trivial win-now/future imbalances as noise
+CONTEXT_FIT_SHARE = 0.15  # the wrong-direction swing has to be at least this share of the
+# value a team moved in the trade before it counts as fighting that team's timeline. A share
+# rather than a fixed number of points: the old absolute threshold was calibrated against
+# summed percentiles and means nothing once assets are priced on the real market scale.
 
 
 def trade_context_fit(state, win_now_impact, future_impact):
-    """Whether a trade fits the team's own timeline (e.g. a rebuilding team giving up
-    future assets to chase a marginal win-now upgrade doesn't make sense even if the
-    raw value is fair) — a ⚠️ result here downgrades the displayed letter grade one
-    full step (see downgrade_grade), since a value-fair trade that fights a team's
-    own timeline isn't actually the A it looks like on paper."""
-    if state == "rebuild" and win_now_impact > CONTEXT_FIT_THRESHOLD and future_impact < -CONTEXT_FIT_THRESHOLD:
-        return "⚠️ Win-now move for a rebuilding team"
-    if state == "contend" and future_impact > CONTEXT_FIT_THRESHOLD and win_now_impact < -CONTEXT_FIT_THRESHOLD:
-        return "⚠️ Future-focused move for a team that should be contending"
-    return "✅ Fits team timeline"
+    """Whether a trade fits the team's own timeline (a rebuilding team chasing a marginal
+    win-now upgrade doesn't make sense even at fair value) — a ⚠️ result downgrades the
+    displayed letter grade one full step (see downgrade_grade).
+
+    Only a team with an actual timeline can fight it: roughly three quarters of this league
+    reads as balanced in any given season, and for those there's nothing to conflict with, so
+    they say so plainly instead of claiming a check passed. The old wording marked every trade
+    "fits team timeline" — including the balanced majority, where nothing had been tested —
+    and it also required BOTH halves of a mismatch to clear a fixed point threshold at once,
+    which in practice never happened."""
+    scale = max(abs(win_now_impact), abs(future_impact), 1.0)
+    if state == "rebuild" and win_now_impact > 0 and future_impact < 0:
+        if abs(future_impact) >= CONTEXT_FIT_SHARE * scale:
+            return "⚠️ Win-now move for a rebuilding team"
+    if state == "contend" and future_impact > 0 and win_now_impact < 0:
+        if abs(win_now_impact) >= CONTEXT_FIT_SHARE * scale:
+            return "⚠️ Future-focused move for a team that should be contending"
+    if state == "balanced":
+        return "➖ No clear timeline to conflict with"
+    return f"✅ Fits a {state}ing team's timeline" if state == "rebuild" else "✅ Fits a contender's timeline"
 
 
 TRADE_GRADE_STEPS = ["F", "D", "C", "B", "A"]  # ascending order
