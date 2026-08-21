@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-trade-conclusion-layout"
+APP_BUILD = "2026-08-20-trade-hindsight-value"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -3074,6 +3074,19 @@ def _trade_step_label(txn_row, my_roster_id, global_team_lookup):
     return f" (from {names[0]})" if len(names) == 1 else ""
 
 
+def _outgoing_share(txn_row, roster_id):
+    """The fraction of a later trade's return that one outgoing asset is credited with.
+
+    When a manager sends several pieces out together, the return genuinely cannot be
+    attributed to any one of them, so it's split evenly. Crediting each outgoing piece with the
+    WHOLE return instead let a single branch compound through every subsequent move until it had
+    absorbed most of a roster's history — which is how one traded tight end appeared to have
+    turned into fourteen assets."""
+    sent_players, sent_picks = _sent_by_roster(txn_row, roster_id)
+    count = len(sent_players) + len(sent_picks)
+    return 1.0 / count if count else 1.0
+
+
 def build_trade_conclusion(seed_txn, players_df, cache_key):
     """What each side of a trade actually has to show for it TODAY.
 
@@ -3118,6 +3131,33 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
         whose = f" ({str(team).strip()}'s)" if team else ""
         return f"{season} {ordinal(rnd)}{whose}"
 
+    # Hindsight valuation of what each side is left holding. Counting assets alone implied a
+    # side that turned one elite player into a pile of spare parts had come out ahead; valuing
+    # them says whether it actually did. Both legs land on the same 0-100 consensus scale.
+    latest = load_table("SELECT league_id, season FROM league_seasons ORDER BY season DESC LIMIT 1")
+    value_table, power_pct = None, {}
+    if not latest.empty:
+        value_table = get_value_table(latest.iloc[0]["league_id"], int(latest.iloc[0]["season"]), cache_key)
+        power_pct = get_season_power_pct(latest.iloc[0]["league_id"], cache_key)
+    # Percentiles are mapped back onto the real market distribution (asset_worth) BEFORE being
+    # summed. Adding raw percentiles rewards quantity over quality -- a dozen fringe assets each
+    # ranking in the 80s would out-total one genuinely elite player, which is exactly how a side
+    # that traded away a star for spare parts looked like the winner.
+    worth_curve = build_asset_worth_curve(cache_key)
+
+    def value_of(kind, key):
+        if kind == "player":
+            if value_table is not None and key in value_table.index:
+                return asset_worth(float(value_table.loc[key, "value"]), worth_curve)
+            return 0.0
+        season, rnd, orig = key
+        try:
+            pct = float(pick_value(rnd, power_pct.get(int(orig), 0.5),
+                                    season=str(season), cache_key=cache_key))
+        except Exception:
+            return 0.0
+        return asset_worth(pct, worth_curve)
+
     results = {}
     for rid in sides:
         owner = owner_of.get((seed_lid, rid))
@@ -3130,13 +3170,13 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
 
         # Each queue item carries the breadcrumb of how it descends from this trade, so a
         # holding several moves removed can explain itself instead of appearing out of nowhere.
-        queue = ([("player", p, seed_created, (label_player(p),)) for p in recv_players]
-                 + [("pick", k, seed_created, (label_pick(k),)) for k in recv_picks])
+        queue = ([("player", p, seed_created, (label_player(p),), 1.0) for p in recv_players]
+                 + [("pick", k, seed_created, (label_pick(k),), 1.0) for k in recv_picks])
         seen, holding, lost, moved_on = set(), [], [], []
         steps = 0
         while queue and steps < TRADE_CONCLUSION_MAX_STEPS:
             steps += 1
-            kind, key, since, trail = queue.pop(0)
+            kind, key, since, trail, share = queue.pop(0)
             if (kind, key) in seen:
                 continue
             seen.add((kind, key))
@@ -3152,18 +3192,19 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                         gone = t
                         break
                 if gone is None:
-                    holding.append(("player", key, label_player(key), trail))
+                    holding.append(("player", key, label_player(key), trail, share))
                     continue
                 if gone["type"] == "trade":
                     my_rid = roster_of.get((owner, gone["league_id"]))
                     got_players, got_picks = _receipts_for_roster(gone, my_rid)
                     step = _trade_step_label(gone, my_rid, global_team_lookup)
-                    queue += [("player", p, gone["created"], trail + (f"{label_player(p)}{step}",))
+                    child = share * _outgoing_share(gone, my_rid)
+                    queue += [("player", p, gone["created"], trail + (f"{label_player(p)}{step}",), child)
                               for p in got_players]
-                    queue += [("pick", k, gone["created"], trail + (f"{label_pick(k)}{step}",))
+                    queue += [("pick", k, gone["created"], trail + (f"{label_pick(k)}{step}",), child)
                               for k in got_picks]
                 else:
-                    lost.append(("player", key, label_player(key), trail))
+                    lost.append(("player", key, label_player(key), trail, share))
                 continue
 
             season, rnd, orig = key
@@ -3184,9 +3225,10 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                     my_rid = roster_of.get((owner, row["league_id"]))
                     got_players, got_picks = _receipts_for_roster(row, my_rid)
                     step = _trade_step_label(row, my_rid, global_team_lookup)
-                    queue += [("player", p, row["created"], trail + (f"{label_player(p)}{step}",))
+                    child = share * _outgoing_share(row, my_rid)
+                    queue += [("player", p, row["created"], trail + (f"{label_player(p)}{step}",), child)
                               for p in got_players]
-                    queue += [("pick", k, row["created"], trail + (f"{label_pick(k)}{step}",))
+                    queue += [("pick", k, row["created"], trail + (f"{label_pick(k)}{step}",), child)
                               for k in got_picks]
                 continue
 
@@ -3200,7 +3242,7 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                 # so the branch ends honestly as "traded away" rather than inventing a holding.
                 my_rid_at_draft = roster_of.get((owner, draft_lid))
                 if my_rid_at_draft is None or int(drafted_by) != int(my_rid_at_draft):
-                    moved_on.append(("pick", key, label_pick(key), trail))
+                    moved_on.append(("pick", key, label_pick(key), trail, share))
                     continue
                 draft_time = since
                 if draft_lid:
@@ -3212,14 +3254,14 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                         if pd.notna(stamp):
                             draft_time = max(since, int(stamp))
                 queue.append(("player", drafted, draft_time,
-                               trail + (f"drafted {label_player(drafted)}",)))
+                               trail + (f"drafted {label_player(drafted)}",), share))
             else:
-                holding.append(("pick", key, label_pick(key), trail))
+                holding.append(("pick", key, label_pick(key), trail, share))
 
         # de-duplicate while preserving order
         def dedupe(items):
             out, taken = [], set()
-            for kind_, key_, lbl, trail_ in items:
+            for kind_, key_, lbl, trail_, share_ in items:
                 if (kind_, key_) in taken:
                     continue
                 taken.add((kind_, key_))
@@ -3228,13 +3270,17 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                 # that counterparty is split off rather than left cluttering the asset's name.
                 tail = trail_[-1] if len(trail_) > 1 else ""
                 acquired = tail[len(lbl):].strip() if tail.startswith(lbl) else ""
-                out.append({"label": lbl, "from": trail_[0],
-                             "path": list(trail_[1:-1]), "acquired": acquired})
+                out.append({"label": lbl, "from": trail_[0], "kind": kind_, "key": key_,
+                             "path": list(trail_[1:-1]), "acquired": acquired, "share": share_,
+                             "full_value": value_of(kind_, key_),
+                             "value": value_of(kind_, key_) * share_})
             return out
 
+        held = dedupe(holding)
         results[owner] = {"received": received, "gave_up": gave_up,
-                           "holding": dedupe(holding), "lost": dedupe(lost),
-                           "moved_on": dedupe(moved_on)}
+                           "holding": held, "lost": dedupe(lost),
+                           "moved_on": dedupe(moved_on),
+                           "value_today": round(sum(h["value"] for h in held), 1)}
     return results
 
 
@@ -5017,8 +5063,10 @@ def page_trade_center():
         st.caption(
             "Each side's current holdings that trace back to this trade — following every piece "
             "through the moves that came after it, so a player later flipped for someone else "
-            "shows up as whoever is on the roster now. When several assets left in one trade the "
-            "return can't be pinned to just one of them, so it's credited to each."
+            "shows up as whoever is on the roster now. Value is today's real market price, so "
+            "this is the hindsight verdict, not the at-the-time grade above. When several pieces "
+            "went out in one trade the return can't be pinned to any one of them, so it's split "
+            "evenly between them and each asset shows the share it's credited with."
         )
         conclusion = build_trade_conclusion(seed_txn, players_df, synced_at)
         name_by_owner = get_manager_name_lookup()
@@ -5035,9 +5083,26 @@ def page_trade_center():
                 # (built for inline bold/colour wrapping) doesn't handle.
                 return escape_markdown(text).replace("|", "\\|")
 
+            # Zero-sum by construction in a two-team trade: what one side is left holding IS
+            # what the other side gave away, so one side's surplus is the other's shortfall.
+            totals = {o: info["value_today"] for o, info in conclusion.items()}
+            ranked = sorted(totals.items(), key=lambda kv: -kv[1])
             parts = []
+            if len(ranked) >= 2 and round(ranked[0][1] - ranked[-1][1]) > 0:
+                lead = ranked[0][1] - ranked[1][1]
+                winner = escape_markdown(name_by_owner.get(ranked[0][0], str(ranked[0][0])))
+                parts.append(f"### {winner} won this trade")
+                parts.append(f"Ahead by **{lead:,.0f}** in market value today, counting everything "
+                              f"each side's pieces have since turned into.")
+            else:
+                parts.append("### Dead even")
+                parts.append("What each side still holds from this trade is worth the same today.")
+            parts.append("")
             for owner, info in conclusion.items():
-                parts.append(f"##### {escape_markdown(name_by_owner.get(owner, str(owner)))}")
+                others = [v for o, v in totals.items() if o != owner]
+                net = info["value_today"] - (max(others) if others else 0.0)
+                parts.append(f"##### {escape_markdown(name_by_owner.get(owner, str(owner)))} — "
+                              f"{info['value_today']:,.0f} ({net:+,.0f})")
                 parts.append("")
                 gained = ", ".join(cell(r) for r in info["received"]) or "—"
                 given = ", ".join(cell(r) for r in info["gave_up"]) or "—"
@@ -5049,16 +5114,19 @@ def page_trade_center():
                 if info["holding"]:
                     parts.append(f"**Has today ({len(info['holding'])})**")
                     parts.append("")
-                    parts.append("| Asset | How it traces back |")
-                    parts.append("| :--- | :--- |")
-                    for h in info["holding"]:
+                    parts.append("| Asset | Value | How it traces back |")
+                    parts.append("| :--- | ---: | :--- |")
+                    for h in sorted(info["holding"], key=lambda x: -x["value"]):
                         if h["path"] or h["from"] != h["label"]:
                             steps = " → ".join(cell(x) for x in [h["from"]] + h["path"])
                         else:
                             steps = "straight from this trade"
                         if h.get("acquired"):
                             steps += f" {cell(h['acquired'])}"
-                        parts.append(f"| **{cell(h['label'])}** | {steps} |")
+                        worth = f"{h['value']:,.0f}"
+                        if h.get("share", 1.0) < 0.99:
+                            worth += f"<br/><sub>{h['share']:.0%} of {h['full_value']:,.0f}</sub>"
+                        parts.append(f"| **{cell(h['label'])}** | {worth} | {steps} |")
                     parts.append("")
                 else:
                     parts.append("**Has today (0)** — nothing left from this trade")
