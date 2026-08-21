@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-fix-trade-residual"
+APP_BUILD = "2026-08-20-trade-ledger-and-drafter-guard"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -2762,8 +2762,9 @@ def get_exact_draft_slot_map_cached(league_id, cache_key):
     return get_exact_draft_slot_map(league_id)
 
 
-def resolve_pick_to_player(pick_season, pick_round, original_roster_id, cache_key):
-    """The real player a specific (season, round, original-owner) pick turned into — None if
+def resolve_pick_detail(pick_season, pick_round, original_roster_id, cache_key):
+    """(player_id, drafting_roster_id, league_id) for the pick — the real player a specific
+    (season, round, original-owner) pick turned into, plus who actually made the selection — None if
     that draft hasn't happened/been synced yet (a still-future pick).
 
     Slot comes from Sleeper's own `drafts.draft_order` (user_id -> real slot), keyed to the
@@ -2775,25 +2776,25 @@ def resolve_pick_to_player(pick_season, pick_round, original_roster_id, cache_ke
     current season's completed rookie draft resolved to nothing and looked unused."""
     season_row = load_table("SELECT league_id FROM league_seasons WHERE season = ?", params=(pick_season,))
     if season_row.empty:
-        return None
+        return None, None, None
     lid = season_row.iloc[0]["league_id"]
     draft_row = load_table(
         "SELECT draft_id, draft_order, type FROM drafts WHERE league_id = ?", params=(lid,))
     if draft_row.empty:
-        return None
+        return None, None, None
     draft_id = draft_row.iloc[0]["draft_id"]
     draft_order = parse_json_field(draft_row.iloc[0]["draft_order"], {}) or {}
     if not draft_order:
-        return None
+        return None, None, None
 
     owner_row = load_table(
         "SELECT owner_id FROM rosters WHERE league_id = ? AND roster_id = ?",
         params=(lid, int(original_roster_id)))
     if owner_row.empty:
-        return None
+        return None, None, None
     slot = draft_order.get(str(owner_row.iloc[0]["owner_id"]))
     if slot is None:
-        return None
+        return None, None, None
 
     teams = len(draft_order)
     round_no = int(pick_round)
@@ -2804,9 +2805,18 @@ def resolve_pick_to_player(pick_season, pick_round, original_roster_id, cache_ke
         slot_in_round = int(slot)
     pick_no = (round_no - 1) * teams + slot_in_round
 
-    result = load_table("SELECT player_id FROM draft_picks WHERE draft_id = ? AND pick_no = ?",
-                         params=(draft_id, pick_no))
-    return result.iloc[0]["player_id"] if not result.empty else None
+    result = load_table(
+        "SELECT player_id, roster_id FROM draft_picks WHERE draft_id = ? AND pick_no = ?",
+        params=(draft_id, pick_no))
+    if result.empty:
+        return None, None, None
+    return result.iloc[0]["player_id"], int(result.iloc[0]["roster_id"]), lid
+
+
+def resolve_pick_to_player(pick_season, pick_round, original_roster_id, cache_key):
+    """Just the player (see resolve_pick_detail for who actually made the selection)."""
+    player_id, _drafter, _lid = resolve_pick_detail(pick_season, pick_round, original_roster_id, cache_key)
+    return player_id
 
 
 def get_player_event_history(player_id):
@@ -3038,6 +3048,17 @@ def _receipts_for_roster(txn_row, roster_id):
     return players, picks
 
 
+def _sent_by_roster(txn_row, roster_id):
+    """(player_ids, pick_keys) one roster GAVE UP in a single transaction — the other half of
+    the ledger, so a trade can be read as what it cost as well as what it returned."""
+    drops = parse_json_field(txn_row["drops"], {}) or {}
+    players = [pid for pid, rid in drops.items() if int(rid) == int(roster_id)]
+    picks = [(p.get("season"), p.get("round"), p.get("roster_id"))
+             for p in (parse_json_field(txn_row["draft_picks"], []) or [])
+             if p.get("previous_owner_id") is not None and int(p["previous_owner_id"]) == int(roster_id)]
+    return players, picks
+
+
 def _trade_step_label(txn_row, my_roster_id, global_team_lookup):
     """" (from <other team>)" for a trade, so a breadcrumb reads like the way someone would
     actually recount it — "that pick became X, who I sent to Y for Z"."""
@@ -3104,12 +3125,14 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
             continue
         recv_players, recv_picks = _receipts_for_roster(seed_txn, rid)
         received = [label_player(p) for p in recv_players] + [label_pick(k) for k in recv_picks]
+        sent_players, sent_picks = _sent_by_roster(seed_txn, rid)
+        gave_up = [label_player(p) for p in sent_players] + [label_pick(k) for k in sent_picks]
 
         # Each queue item carries the breadcrumb of how it descends from this trade, so a
         # holding several moves removed can explain itself instead of appearing out of nowhere.
         queue = ([("player", p, seed_created, (label_player(p),)) for p in recv_players]
                  + [("pick", k, seed_created, (label_pick(k),)) for k in recv_picks])
-        seen, holding, lost = set(), [], []
+        seen, holding, lost, moved_on = set(), [], [], []
         steps = 0
         while queue and steps < TRADE_CONCLUSION_MAX_STEPS:
             steps += 1
@@ -3167,14 +3190,23 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                               for k in got_picks]
                 continue
 
-            drafted = resolve_pick_to_player(season, rnd, orig, cache_key)
+            drafted, drafted_by, draft_lid = resolve_pick_detail(season, rnd, orig, cache_key)
             if drafted:
-                pick_lid = season_league.get(str(season))
+                # Only credit the player to the manager who ACTUALLY made the selection. A pick
+                # this manager flipped before the draft still resolves to whoever was taken at
+                # that slot, and crediting them with a player they never drafted was reporting
+                # plain falsehoods ("Dalt drafted Jonah Coleman" for a pick he had traded away).
+                # If the move that sent it on isn't in `transactions` we can't follow the return,
+                # so the branch ends honestly as "traded away" rather than inventing a holding.
+                my_rid_at_draft = roster_of.get((owner, draft_lid))
+                if my_rid_at_draft is None or int(drafted_by) != int(my_rid_at_draft):
+                    moved_on.append(("pick", key, label_pick(key), trail))
+                    continue
                 draft_time = since
-                if pick_lid:
+                if draft_lid:
                     drow = load_table(
                         "SELECT last_picked, start_time FROM drafts WHERE league_id = ?",
-                        params=(pick_lid,))
+                        params=(draft_lid,))
                     if not drow.empty:
                         stamp = drow.iloc[0]["last_picked"] or drow.iloc[0]["start_time"]
                         if pd.notna(stamp):
@@ -3198,7 +3230,9 @@ def build_trade_conclusion(seed_txn, players_df, cache_key):
                              "from": trail_[0], "path": list(trail_[1:-1])})
             return out
 
-        results[owner] = {"received": received, "holding": dedupe(holding), "lost": dedupe(lost)}
+        results[owner] = {"received": received, "gave_up": gave_up,
+                           "holding": dedupe(holding), "lost": dedupe(lost),
+                           "moved_on": dedupe(moved_on)}
     return results
 
 
@@ -4986,35 +5020,41 @@ def page_trade_center():
         )
         conclusion = build_trade_conclusion(seed_txn, players_df, synced_at)
         name_by_owner = get_manager_name_lookup()
-        # Keyed to the selected trade so switching trades builds a FRESH subtree instead of
-        # reusing the previous one. Without it the number of side-by-side columns changes
-        # between a two-team and a three-team trade, and the browser kept showing leftovers
-        # of the trade you'd just navigated away from.
-        conclusion_box = st.container(key=f"trade_conclusion_{seed_txn['transaction_id']}")
         if not conclusion:
-            conclusion_box.info("Couldn't resolve the sides of this trade.")
+            st.info("Couldn't resolve the sides of this trade.")
         else:
-            cols = conclusion_box.columns(len(conclusion))
-            for col, (owner, info) in zip(cols, conclusion.items()):
-                with col:
-                    st.markdown(f"**{escape_markdown(name_by_owner.get(owner, str(owner)))}**")
-                    st.caption("Got: " + (", ".join(escape_markdown(r) for r in info["received"])
-                                           or "nothing recorded"))
-                    if info["holding"]:
-                        st.markdown("**Still has:**")
-                        for h in info["holding"]:
-                            st.markdown(f"• **{escape_markdown(h['label'])}**")
-                            if h["path"] or h["from"] != h["label"]:
-                                steps = [h["from"]] + h["path"]
-                                st.caption("via " + " → ".join(escape_markdown(s) for s in steps))
-                    else:
-                        st.markdown("**Still has:** nothing left from this trade")
-                    if info["lost"]:
-                        st.caption("Dropped along the way: "
-                                    + ", ".join(escape_markdown(l["label"]) for l in info["lost"]))
+            # Rendered as ONE markdown block on purpose. This used to be a per-side column
+            # layout, but the number of columns changes with the number of teams in the trade,
+            # and the browser reused DOM nodes across reruns and kept showing pieces of the
+            # trade you'd just navigated away from. A single element of fixed shape has no
+            # children to leave behind, so switching trades can't leave residue.
+            parts = []
+            for owner, info in conclusion.items():
+                parts.append(f"**{escape_markdown(name_by_owner.get(owner, str(owner)))}**")
+                gained = ", ".join(escape_markdown(r) for r in info["received"]) or "nothing recorded"
+                given = ", ".join(escape_markdown(r) for r in info["gave_up"]) or "nothing recorded"
+                parts.append(f"- Gave up ({len(info['gave_up'])}): {given}")
+                parts.append(f"- Got ({len(info['received'])}): {gained}")
+                if info["holding"]:
+                    parts.append(f"- **Still has ({len(info['holding'])}):**")
+                    for h in info["holding"]:
+                        line = f"    - **{escape_markdown(h['label'])}**"
+                        if h["path"] or h["from"] != h["label"]:
+                            steps = " → ".join(escape_markdown(x) for x in [h["from"]] + h["path"])
+                            line += "  \n      *via " + steps + "*"
+                        parts.append(line)
+                else:
+                    parts.append("- **Still has:** nothing left from this trade")
+                if info["lost"]:
+                    parts.append("- Dropped along the way: "
+                                  + ", ".join(escape_markdown(l["label"]) for l in info["lost"]))
+                if info["moved_on"]:
+                    parts.append("- Traded on before the draft: "
+                                  + ", ".join(escape_markdown(m["label"]) for m in info["moved_on"]))
+                parts.append("")
+            st.markdown("\n".join(parts))
 
-        with st.expander("Full asset-by-asset trail",
-                          key=f"trade_trail_{seed_txn['transaction_id']}"):
+        with st.expander("Full asset-by-asset trail"):
             chains = build_trade_lineage(seed_txn, players_df, synced_at)
             blocks = render_trade_lineage_timeline(chains, players_df, global_team_lookup)
             if not blocks:
