@@ -81,7 +81,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-trade-grade-real-worth"
+APP_BUILD = "2026-08-20-aging-real-value"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -2588,24 +2588,38 @@ def build_trade_aging_detail(txn, power_pct, players_df, cache_key):
     as_of = trade_as_of_date(txn)
     historical_values = compute_consensus_player_values(cache_key, as_of_date=as_of)
     live_values = compute_consensus_player_values(cache_key)
+    # Reported as real market value, not the underlying percentile. A percentile has nowhere
+    # left to climb at the top of the pool: a player already ranked 96th could gain a fifth of
+    # his real trade value and still show as fractionally DOWN, because everyone around him rose
+    # too. Each side is mapped through the value distribution of its own date, so "then" is what
+    # he was really worth at the trade and "now" is what he's worth today.
+    then_curve = build_asset_worth_curve(cache_key, as_of_date=as_of)
+    now_curve = build_asset_worth_curve(cache_key)
 
     adds = parse_json_field(txn["adds"], {})
     drops = parse_json_field(txn["drops"], {})
     draft_picks = parse_json_field(txn["draft_picks"], [])
 
+    def aged_row(label, then_pct, now_pct):
+        then_val = asset_worth(then_pct, then_curve)
+        now_val = asset_worth(now_pct, now_curve)
+        return {"asset": label, "then": round(then_val), "now": round(now_val),
+                "swing": round(now_val - then_val)}
+
     rows = []
     for player_id in set(adds) | set(drops):
         name = players_df.loc[player_id, "full_name"] if player_id in players_df.index else player_id
-        then_val, now_val = historical_values.get(player_id, 0.0), live_values.get(player_id, 0.0)
-        rows.append({"asset": name, "then": then_val, "now": now_val, "swing": round(now_val - then_val, 1)})
+        rows.append(aged_row(name, historical_values.get(player_id, 0.0),
+                              live_values.get(player_id, 0.0)))
 
     for pick in draft_picks:
         label = f"{pick.get('season')} Round {pick.get('round')} pick"
-        then_val = pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5),
-                               season=pick.get("season"), cache_key=cache_key, as_of_date=as_of)
-        now_val = pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5),
-                              season=pick.get("season"), cache_key=cache_key)
-        rows.append({"asset": label, "then": then_val, "now": now_val, "swing": round(now_val - then_val, 1)})
+        rows.append(aged_row(
+            label,
+            pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5),
+                        season=pick.get("season"), cache_key=cache_key, as_of_date=as_of),
+            pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5),
+                        season=pick.get("season"), cache_key=cache_key)))
 
     return pd.DataFrame(rows)
 
@@ -5255,11 +5269,14 @@ def page_trade_center():
                         use_container_width=True, hide_index=True,
                     )
                     st.caption(
-                        "Then = external market consensus as of this trade's real date; Now = today's "
-                        "live consensus — a pure hindsight view, doesn't change the grade above. Trades "
-                        "before this feature's archive started only have DynastyProcess's own signal for "
-                        "their historical side (FantasyCalc has no historical API), so \"Then\" may be "
-                        "less precise than trades graded going forward."
+                        "Real market value as of this trade's own date vs. today — a pure hindsight "
+                        "view, doesn't change the grade above. Shown as market value rather than a "
+                        "percentile rank because a player already near the top of the pool has nowhere "
+                        "left to climb: he can gain a fifth of his real trade value and still rank "
+                        "fractionally lower, since everyone around him rose too. Trades from before this "
+                        "feature's archive started only have DynastyProcess's own signal for their "
+                        "historical side (FantasyCalc has no historical API), so \"Then\" may be less "
+                        "precise than trades graded going forward."
                     )
             st.divider()
 
