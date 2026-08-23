@@ -6,6 +6,7 @@
 # has, with no extra manual step. For local/Colab testing instead of the deployed
 # copy, use blue_ballers_dashboard.py, which mounts Drive directly.
 
+import bisect
 import json
 import os
 import sqlite3
@@ -81,7 +82,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-20-aging-real-value"
+APP_BUILD = "2026-08-23-aging-single-source"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -2578,50 +2579,120 @@ def trade_as_of_date(txn):
     return season_end_as_of_date(txn["season"])
 
 
+AGING_SOURCE = "dynastyprocess_value"  # the only source with real history: FantasyCalc has no
+# historical API, so its archive only begins the day this app started recording it. Comparing a
+# past date against today therefore has to stay on ONE source, or "then" and "now" are read off
+# two different price scales entirely.
+
+
+@st.cache_data(ttl=1800)
+def _aging_price_history(cache_key):
+    """player_id -> (ascending dates, values) for AGING_SOURCE. Built once and bisected per
+    lookup: the aging table renders inside an expander for every trade in the list, and
+    Streamlit runs an expander's body whether or not it's open, so a full re-scan of the
+    snapshot archive per trade made the whole page crawl."""
+    df = get_external_player_snapshots(cache_key)
+    df = df[df["source"] == AGING_SOURCE].sort_values("scrape_date")
+    return {pid: (list(g["scrape_date"]), list(g["raw_value"]))
+            for pid, g in df.groupby("sleeper_player_id")}
+
+
+def _aging_player_value(history, player_id, as_of_date=None):
+    """That player's AGING_SOURCE price on/before as_of_date (or his latest), else None."""
+    entry = history.get(player_id)
+    if not entry:
+        return None
+    dates, values = entry
+    if as_of_date is None:
+        return values[-1]
+    idx = bisect.bisect_right(dates, as_of_date) - 1
+    return values[idx] if idx >= 0 else None
+
+
+PICK_SNAPSHOT_KEYS = ["season", "round", "granularity", "slot", "tier"]
+
+
+@st.cache_data(ttl=1800)
+def _aging_pick_history(cache_key):
+    """One (dates, values) series per distinct AGING_SOURCE pick row, for the same reason as
+    _aging_price_history: collapsing the whole pick archive once per trade was the bulk of the
+    Trade Center's load time."""
+    df = get_external_pick_snapshots(cache_key)
+    df = df[df["source"] == AGING_SOURCE].sort_values("scrape_date")
+    return {key: (list(g["scrape_date"]), list(g["raw_value"]))
+            for key, g in df.groupby(PICK_SNAPSHOT_KEYS)}
+
+
+def _aging_pick_snapshots(cache_key, as_of_date=None):
+    """AGING_SOURCE pick rows as of a date, in the shape _pick_raw_value expects."""
+    rows = []
+    for key, (dates, values) in _aging_pick_history(cache_key).items():
+        if as_of_date is None:
+            value = values[-1]
+        else:
+            idx = bisect.bisect_right(dates, as_of_date) - 1
+            if idx < 0:
+                continue
+            value = values[idx]
+        rows.append(dict(zip(PICK_SNAPSHOT_KEYS, key), source=AGING_SOURCE, raw_value=value))
+    return pd.DataFrame(rows, columns=PICK_SNAPSHOT_KEYS + ["source", "raw_value"])
+
+
+def _aging_pick_value(pick_latest, season, round_no, power_percentile):
+    """Raw AGING_SOURCE market value for one pick, priced at the slot that team's strength
+    implies — the same slot estimate pick_value uses, so the two views agree on which pick
+    this is."""
+    if pick_latest is None or pick_latest.empty:
+        return None
+    estimated_slot = 1 + (1 - power_percentile) * 7
+    return _pick_raw_value(pick_latest, AGING_SOURCE, season, round_no, estimated_slot, 8, True)
+
+
 def build_trade_aging_detail(txn, power_pct, players_df, cache_key):
-    """Per-asset value-at-the-time vs. today's live value for one trade —
-    the 'how this trade aged' hindsight view. Purely additive to grade_trade's
-    at-the-time grade above, never a replacement for it. Uses the trade's
-    exact date (trade_as_of_date), not build_historical_value_table's
-    coarser season-end approximation, since this is a single on-demand
-    lookup rather than a table reused across many trades."""
+    """Per-asset value-at-the-time vs. today's value for one trade — the 'how this trade aged'
+    hindsight view. Purely additive to grade_trade's at-the-time grade, never a replacement.
+    Uses the trade's exact date (trade_as_of_date), not build_historical_value_table's coarser
+    season-end approximation, since this is a single on-demand lookup.
+
+    Reports each asset's real market price on ONE source's scale (AGING_SOURCE), rather than a
+    consensus percentile. Percentiles saturate: a player already ranked near the top of the pool
+    can gain a fifth of his real trade value and still show fractionally DOWN, because everyone
+    around him moved too. Mapping each side through its own date's value distribution instead
+    was worse — with only one source carrying real history, "then" and "now" ended up on
+    different scales and a player who had genuinely lost two thirds of his value read as a
+    small gain."""
     as_of = trade_as_of_date(txn)
-    historical_values = compute_consensus_player_values(cache_key, as_of_date=as_of)
-    live_values = compute_consensus_player_values(cache_key)
-    # Reported as real market value, not the underlying percentile. A percentile has nowhere
-    # left to climb at the top of the pool: a player already ranked 96th could gain a fifth of
-    # his real trade value and still show as fractionally DOWN, because everyone around him rose
-    # too. Each side is mapped through the value distribution of its own date, so "then" is what
-    # he was really worth at the trade and "now" is what he's worth today.
-    then_curve = build_asset_worth_curve(cache_key, as_of_date=as_of)
-    now_curve = build_asset_worth_curve(cache_key)
+    history = _aging_price_history(cache_key)
+    then_picks = _aging_pick_snapshots(cache_key, as_of_date=as_of)
+    now_picks = _aging_pick_snapshots(cache_key)
 
     adds = parse_json_field(txn["adds"], {})
     drops = parse_json_field(txn["drops"], {})
     draft_picks = parse_json_field(txn["draft_picks"], [])
 
-    def aged_row(label, then_pct, now_pct):
-        then_val = asset_worth(then_pct, then_curve)
-        now_val = asset_worth(now_pct, now_curve)
-        return {"asset": label, "then": round(then_val), "now": round(now_val),
-                "swing": round(now_val - then_val)}
+    def row(label, then_val, now_val):
+        if then_val is None or now_val is None:
+            return {"asset": label, "then": None, "now": None, "swing": None}
+        return {"asset": label, "then": round(float(then_val)), "now": round(float(now_val)),
+                "swing": round(float(now_val) - float(then_val))}
 
     rows = []
     for player_id in set(adds) | set(drops):
         name = players_df.loc[player_id, "full_name"] if player_id in players_df.index else player_id
-        rows.append(aged_row(name, historical_values.get(player_id, 0.0),
-                              live_values.get(player_id, 0.0)))
+        rows.append(row(name, _aging_player_value(history, player_id, as_of),
+                         _aging_player_value(history, player_id)))
 
     for pick in draft_picks:
         label = f"{pick.get('season')} Round {pick.get('round')} pick"
-        rows.append(aged_row(
+        pct = power_pct.get(pick.get("roster_id"), 0.5)
+        rows.append(row(
             label,
-            pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5),
-                        season=pick.get("season"), cache_key=cache_key, as_of_date=as_of),
-            pick_value(pick.get("round", 4), power_pct.get(pick.get("roster_id"), 0.5),
-                        season=pick.get("season"), cache_key=cache_key)))
+            _aging_pick_value(then_picks, pick.get("season"), pick.get("round", 4), pct),
+            _aging_pick_value(now_picks, pick.get("season"), pick.get("round", 4), pct)))
 
-    return pd.DataFrame(rows)
+    # Explicit columns so an assetless trade still returns the expected shape rather than an
+    # empty frame the caller then indexes into.
+    return pd.DataFrame(rows, columns=["asset", "then", "now", "swing"])
 
 
 CONTEXT_FIT_SHARE = 0.15  # the wrong-direction swing has to be at least this share of the
