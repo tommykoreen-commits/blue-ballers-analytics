@@ -82,7 +82,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-23-aging-single-source"
+APP_BUILD = "2026-08-23-trade-history-paging"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -2695,6 +2695,9 @@ def build_trade_aging_detail(txn, power_pct, players_df, cache_key):
     return pd.DataFrame(rows, columns=["asset", "then", "now", "swing"])
 
 
+TRADE_HISTORY_PAGE = 20  # trades drawn before asking, since each one is fully graded and aged
+
+
 CONTEXT_FIT_SHARE = 0.15  # the wrong-direction swing has to be at least this share of the
 # value a team moved in the trade before it counts as fighting that team's timeline. A share
 # rather than a fixed number of points: the old absolute threshold was calibrated against
@@ -5300,7 +5303,18 @@ def page_trade_center():
             all_trades = all_trades[all_trades.apply(trade_matches, axis=1)]
 
         st.caption(f"{len(all_trades)} trade(s)")
-        for _, txn in all_trades.iterrows():
+        # Every trade rendered here is fully graded and aged, and Streamlit runs the body of the
+        # "how this trade aged" expander whether or not it's open, so the whole history costs
+        # tens of seconds to draw. Newest-first already, so the recent page is the useful one;
+        # searching narrows the list before this and is unaffected.
+        visible = all_trades
+        if len(all_trades) > TRADE_HISTORY_PAGE:
+            if st.checkbox(f"Show all {len(all_trades)} trades (slower)", value=False):
+                visible = all_trades
+            else:
+                visible = all_trades.head(TRADE_HISTORY_PAGE)
+                st.caption(f"Showing the {len(visible)} most recent — search above to find older ones.")
+        for _, txn in visible.iterrows():
             trade_value_table = get_historical_value_table(int(txn["season"]), synced_at)
             trade_power_pct = get_season_power_pct(txn["league_id"], synced_at)
             sides = grade_trade(txn, trade_value_table, trade_power_pct, global_team_lookup, txn["league_id"],
