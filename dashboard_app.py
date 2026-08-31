@@ -82,7 +82,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-23-faster-load"
+APP_BUILD = "2026-08-23-rookie-grades-by-class-rank"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -3487,12 +3487,6 @@ def get_all_ever_rostered_ids():
 # all players, 1 = rookies only) using the same value heuristic as Team
 # Pages, plus a league-wide view of future draft pick value.
 # ---------------------------------------------------------------------------
-def expected_pick_value(pick_no):
-    """Smooth per-pick decay matching ROUND_BASE_VALUE at round boundaries
-    (pick 1 = 100, pick 9 = 50, pick 17 = 25, pick 25 = 12.5 for an 8-team league)."""
-    return 100 * (0.5 ** ((pick_no - 1) / 8))
-
-
 def build_rookie_draft_list():
     all_seasons = load_table("SELECT league_id, season FROM league_seasons ORDER BY season DESC")
     rows = []
@@ -3517,11 +3511,21 @@ def get_draft_picks_detail(draft_id):
 
 
 def grade_rookie_draft(draft_id, league_id, career_value_table, global_team_lookup, players_df):
+    """Grades each pick by where the player ranks WITHIN his own draft class against where he
+    was taken: the 5th-best player going 27th is a steal, the 20th-best going 2nd is a reach.
+
+    Ranking rather than subtracting values, because the two sides were never on the same scale.
+    A player's consensus value is a percentile against the whole player pool, where any rostered
+    rookie lands in the 70s or 80s, while the old expectation curve decayed to about 7 by the
+    end of the draft -- so every late pick banked a large positive score automatically and the
+    first pick could not win even when it was the best player in the class. Both real drafts
+    graded picks 26-32 as their five best and picks 1-3 as their worst, which meant Ashton Jeanty
+    and Jeremiyah Love were the worst picks of their drafts. Comparing ranks is immune to that:
+    it doesn't care what scale the values are on, only their order."""
     picks = get_draft_picks_detail(draft_id)
     rows = []
     for _, p in picks.iterrows():
         pid = p["player_id"]
-        expected = expected_pick_value(p["pick_no"])
         career_row = career_value_table.loc[pid] if pid in career_value_table.index else None
         career = career_row["value"] if career_row is not None else 0.0
         info = players_df.loc[pid] if pid in players_df.index else None
@@ -3533,11 +3537,18 @@ def grade_rookie_draft(draft_id, league_id, career_value_table, global_team_look
             "team": global_team_lookup.get((league_id, roster_id), f"Roster {roster_id}"),
             "player": info["full_name"] if info is not None else pid,
             "position": info["position"] if info is not None else "",
-            "expected_value": round(expected, 1),
             "career_value": round(career, 1),
-            "delta": round(career - expected, 1),
         })
-    return pd.DataFrame(rows)
+    board = pd.DataFrame(rows)
+    if board.empty:
+        return pd.DataFrame(columns=["pick_no", "round", "roster_id", "team", "player",
+                                      "position", "career_value", "class_rank", "delta"])
+    # Ties (notably everyone with no value on record) fall back to draft order, so an unvalued
+    # player is treated as having gone about where he was expected to rather than as a disaster.
+    board = board.sort_values(["career_value", "pick_no"], ascending=[False, True])
+    board["class_rank"] = range(1, len(board) + 1)
+    board["delta"] = board["pick_no"] - board["class_rank"]
+    return board.sort_values("pick_no").reset_index(drop=True)
 
 
 @st.cache_data(ttl=1800)
@@ -3547,8 +3558,12 @@ def get_rookie_draft_grades(draft_id, league_id, latest_season_year, cache_key):
 
 
 def summarize_team_grades(draft_board):
+    """Team draft grade from the slots each of its picks gained or lost. Banded on distance from
+    the league average (zscore_to_grade) rather than rank: with eight teams a rank percentile can
+    only take eight values, so a team that drafted far better than everyone landed in the same
+    band as one that merely edged them out."""
     team_deltas = draft_board.groupby("team")["delta"].sum().reset_index()
-    team_deltas["grade"] = to_grade(team_deltas["delta"].rank(pct=True))
+    team_deltas["grade"] = zscore_to_grade(team_deltas["delta"])
     return team_deltas.sort_values("delta", ascending=False)
 
 
@@ -5404,7 +5419,7 @@ def page_rookie_draft():
             team_grades = summarize_team_grades(draft_board)
             st.dataframe(
                 style_grades(
-                    team_grades.rename(columns={"team": "Team", "delta": "Total Value Over Expected", "grade": "Grade"}),
+                    team_grades.rename(columns={"team": "Team", "delta": "Total Slots Gained", "grade": "Grade"}),
                     ["Grade"],
                 ),
                 use_container_width=True, hide_index=True,
@@ -5438,11 +5453,11 @@ def page_rookie_draft():
     
             st.write("**Full Draft Board**")
             st.dataframe(
-                draft_board[["pick_no", "round", "team", "player", "position", "expected_value",
+                draft_board[["pick_no", "round", "team", "player", "position", "class_rank",
                              "career_value", "delta"]]
                 .rename(columns={"pick_no": "Pick", "round": "Round", "team": "Team", "player": "Player",
-                                  "position": "Pos", "expected_value": "Expected", "career_value": "Career",
-                                  "delta": "Delta"}),
+                                  "position": "Pos", "class_rank": "Class Rank", "career_value": "Value",
+                                  "delta": "Slots Gained"}),
                 use_container_width=True, hide_index=True,
             )
 
