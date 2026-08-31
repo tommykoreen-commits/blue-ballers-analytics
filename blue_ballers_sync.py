@@ -101,8 +101,12 @@ except Exception:
     GITHUB_TOKEN = None
 
 SYNC_LEAGUE_NEWS = True
-GEMINI_MODEL = "gemini-3.7-flash"
-GEMINI_PACING_SECONDS = 4  # stay well under the free tier's per-minute cap during a ~28-week backfill
+GEMINI_MODEL = "gemini-2.5-flash"  # an established model, not the newest. Google no longer
+# publishes per-model free-tier numbers, but gemini-3.7-flash reported a daily cap of 20
+# requests on this account -- a promotional allowance for a brand-new model -- which stalled the
+# recap backfill at roughly one article per day. Check the real numbers for whichever model is
+# set here at https://aistudio.google.com/rate-limit
+GEMINI_PACING_SECONDS = 6  # roughly ten requests a minute, the usual free-tier ceiling
 
 try:
     from google.colab import userdata
@@ -1268,13 +1272,26 @@ def build_upset_history():
     return pd.DataFrame(rows)
 
 
+TRANSIENT_RETRY_MAX_SECONDS = 90  # a 429 asking us to wait less than this is a per-minute
+# throttle worth waiting out; anything longer (or unstated) is treated as the daily cap.
+
+
 class QuotaExhausted(Exception):
-    """The free tier's daily request budget for GEMINI_MODEL is used up, confirmed by
-    Google's own 'exceeded your current quota' message -- distinct from a short-lived
-    429 blip, this will not clear up within the same run no matter how long a retry
-    waits (confirmed empirically: 2026-08-20's run kept hitting this same wall for 30
-    straight weeks after the first few succeeded). The caller stops the whole backfill
-    immediately on this rather than wasting retries/time on every remaining week."""
+    """The free tier's DAILY request budget for GEMINI_MODEL is used up -- it won't clear
+    within this run however long a retry waits, so the caller stops the whole backfill rather
+    than burning retries on every remaining week.
+
+    Not every "exceeded your current quota" 429 means this. Google uses that same wording for
+    the per-MINUTE throttle, which clears in seconds, so keying off the phrase alone would abort
+    a whole run over a momentary limit -- harmless while the daily cap was 20 requests and every
+    error really was terminal, but wrong the moment the daily budget is large enough to keep
+    going. The retry delay Google supplies is what separates them."""
+
+
+def _retry_delay_seconds(message):
+    """Seconds Google asked us to wait, from its "Please retry in 35.9s" hint."""
+    match = re.search(r"retry in ([\d.]+)s", message)
+    return float(match.group(1)) if match else None
 
 
 def generate_recap_text(client, prompt):
@@ -1290,13 +1307,22 @@ def generate_recap_text(client, prompt):
                 raise RuntimeError("Gemini returned empty output_text")
             return text
         except Exception as e:
-            if "429" in str(e) and "exceeded your current quota" in str(e).lower():
-                raise QuotaExhausted(str(e))
+            message = str(e)
             last_err = e
-            if "429" in str(e) or "rate" in str(e).lower():
+            if "429" in message:
+                wait = _retry_delay_seconds(message)
+                if wait is not None and wait <= TRANSIENT_RETRY_MAX_SECONDS:
+                    time.sleep(wait + 2)  # per-minute throttle: wait exactly as long as asked
+                    continue
+                raise QuotaExhausted(message)
+            if "rate" in message.lower():
                 time.sleep(5 * (attempt + 1))
                 continue
             raise
+    # Still throttled after every retry: treat it as spent for this run so the backfill stops
+    # cleanly and resumes next time, rather than raising a bare None.
+    if last_err is not None and "429" in str(last_err):
+        raise QuotaExhausted(str(last_err))
     raise last_err
 
 
