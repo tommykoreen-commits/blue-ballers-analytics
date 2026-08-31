@@ -82,7 +82,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-23-stale-copy-age"
+APP_BUILD = "2026-08-23-warn-data-build-date"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -104,6 +104,19 @@ def download_db():
             time.sleep(2)
     st.session_state["db_download_error"] = str(last_error)
     return False
+
+
+def _local_db_built_label():
+    """When the on-disk database was actually built, read from the database itself — falls back
+    to the file's own timestamp if it can't be read for any reason."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            synced = conn.execute("SELECT MAX(synced_at) FROM league_seasons").fetchone()[0]
+        if synced:
+            return str(synced)[:10]
+    except Exception:
+        pass
+    return datetime.fromtimestamp(os.path.getmtime(DB_PATH)).date().isoformat()
 
 
 def ensure_db():
@@ -128,16 +141,15 @@ def ensure_db():
     if download_db():
         return
     if have_local_copy:
-        # Say how old the fallback is: "couldn't refresh" alone doesn't tell you whether it
-        # matters, and a copy pulled an hour ago is a non-event while one from last week isn't.
-        age_hours = (time.time() - os.path.getmtime(DB_PATH)) / 3600
-        age = (f"{age_hours:.0f} hours ago" if age_hours < 48
-               else f"{age_hours / 24:.0f} days ago")
+        # Report when this data was BUILT, not when the file was downloaded. Those differ, and
+        # the download date is the misleading one: the database only changes when a sync runs, so
+        # a copy pulled days ago is perfectly current if no sync has happened since. Saying
+        # "downloaded 11 days ago" implied lost data when nothing had been missed at all.
         st.warning(
-            f"Couldn't refresh data from Google Drive just now (it may be temporarily "
-            f"rate-limited) — showing the copy downloaded {age}. Drive's anonymous-download "
-            f"limit usually clears within the hour; the sidebar's Last synced shows when that "
-            f"copy was actually built."
+            f"Couldn't refresh from Google Drive just now (its anonymous-download limit is "
+            f"strict for cloud-hosted apps) — showing the copy already downloaded, built "
+            f"{_local_db_built_label()}. That's the whole database as of that sync: if no sync "
+            f"has run since, nothing is missing."
         )
     else:
         st.error(f"Couldn't download the database from Google Drive: {st.session_state.get('db_download_error')}")
