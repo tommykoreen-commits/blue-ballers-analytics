@@ -1594,12 +1594,15 @@ def publish_db_to_github(token, repo, tag, db_path):
                                        headers=headers, timeout=30)
             if deleted.status_code == 403:
                 # Reading a public repo needs no auth at all, so everything above succeeds even
-                # with a read-only token; this is the first call that actually requires write.
+                # with a token that can't write; this is the first call that actually requires it.
+                # GitHub's own message is quoted verbatim -- it distinguishes a missing permission
+                # ("Resource not accessible by personal access token") from the other things a 403
+                # can mean, and paraphrasing it sent us chasing the wrong setting once already.
                 raise PermissionError(
-                    "GitHub refused to replace the existing database asset (403). The token in "
-                    "Colab's GITHUB_TOKEN secret can read this repo but can't write to it. A "
-                    "classic token needs the `repo` scope; a fine-grained token needs Contents: "
-                    "Read and write on tommykoreen-commits/blue-ballers-analytics.")
+                    f"GitHub refused to replace the existing database asset (403). GitHub said: "
+                    f"{deleted.text[:400]} -- a classic token needs the `repo` scope; a "
+                    f"fine-grained token needs Contents: Read and write, with this repository "
+                    f"included in its repository access.")
             deleted.raise_for_status()
 
     with open(db_path, "rb") as fh:
