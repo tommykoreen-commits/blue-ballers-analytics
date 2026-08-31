@@ -1562,8 +1562,17 @@ def publish_db_to_github(token, repo, tag, db_path):
     for asset in release.get("assets", []):
         if asset["name"] == name:
             # A release can't hold two assets with the same name, so the old one goes first.
-            requests.delete(f"{api}/repos/{repo}/releases/assets/{asset['id']}",
-                             headers=headers, timeout=30).raise_for_status()
+            deleted = requests.delete(f"{api}/repos/{repo}/releases/assets/{asset['id']}",
+                                       headers=headers, timeout=30)
+            if deleted.status_code == 403:
+                # Reading a public repo needs no auth at all, so everything above succeeds even
+                # with a read-only token; this is the first call that actually requires write.
+                raise PermissionError(
+                    "GitHub refused to replace the existing database asset (403). The token in "
+                    "Colab's GITHUB_TOKEN secret can read this repo but can't write to it. A "
+                    "classic token needs the `repo` scope; a fine-grained token needs Contents: "
+                    "Read and write on tommykoreen-commits/blue-ballers-analytics.")
+            deleted.raise_for_status()
 
     with open(db_path, "rb") as fh:
         upload = requests.post(
