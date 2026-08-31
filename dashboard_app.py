@@ -82,7 +82,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-23-rookie-grades-by-class-rank"
+APP_BUILD = "2026-08-23-stale-copy-age"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -128,9 +128,16 @@ def ensure_db():
     if download_db():
         return
     if have_local_copy:
+        # Say how old the fallback is: "couldn't refresh" alone doesn't tell you whether it
+        # matters, and a copy pulled an hour ago is a non-event while one from last week isn't.
+        age_hours = (time.time() - os.path.getmtime(DB_PATH)) / 3600
+        age = (f"{age_hours:.0f} hours ago" if age_hours < 48
+               else f"{age_hours / 24:.0f} days ago")
         st.warning(
-            "Couldn't refresh data from Google Drive just now (it may be temporarily "
-            "rate-limited) — showing the last successfully downloaded copy instead."
+            f"Couldn't refresh data from Google Drive just now (it may be temporarily "
+            f"rate-limited) — showing the copy downloaded {age}. Drive's anonymous-download "
+            f"limit usually clears within the hour; the sidebar's Last synced shows when that "
+            f"copy was actually built."
         )
     else:
         st.error(f"Couldn't download the database from Google Drive: {st.session_state.get('db_download_error')}")
