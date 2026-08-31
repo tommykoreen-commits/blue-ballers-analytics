@@ -101,11 +101,13 @@ except Exception:
     GITHUB_TOKEN = None
 
 SYNC_LEAGUE_NEWS = True
-GEMINI_MODEL = "gemini-2.5-flash"  # an established model, not the newest. Google no longer
-# publishes per-model free-tier numbers, but gemini-3.7-flash reported a daily cap of 20
-# requests on this account -- a promotional allowance for a brand-new model -- which stalled the
-# recap backfill at roughly one article per day. Check the real numbers for whichever model is
-# set here at https://aistudio.google.com/rate-limit
+GEMINI_MODEL = "gemini-3.6-flash"  # Google's own current recommendation: the API rejects
+# gemini-2.5-flash with "no longer available to new users. Please update your code to use
+# models/gemini-3.6-flash", and gemini-3.7-flash reported a daily cap of 20 requests on this
+# account (a promotional allowance for a brand-new model) which stalled the recap backfill at
+# about one article per day. Google no longer publishes per-model free-tier numbers, and
+# third-party summaries of them proved unreliable -- the API's own errors and
+# https://aistudio.google.com/rate-limit are the only trustworthy sources.
 GEMINI_PACING_SECONDS = 6  # roughly ten requests a minute, the usual free-tier ceiling
 
 try:
