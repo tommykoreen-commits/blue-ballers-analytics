@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -82,27 +83,45 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-23-warn-data-build-date"
+APP_BUILD = "2026-08-23-db-from-github-release"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
 
+DB_RELEASE_URL = ("https://github.com/tommykoreen-commits/blue-ballers-analytics"
+                  "/releases/download/data/blue_ballers.db")
+
+
 def download_db():
-    """One attempt at pulling the latest database from Google Drive, with a single
-    retry — Drive's anonymous-link downloads are occasionally flaky/rate-limited
-    (seen in production as a bare gdown.exceptions.FileURLRetrievalError), and a
-    fresh container hitting this on every cold start is a real risk, not a
-    hypothetical one. Returns True on success, False on failure (caller decides
-    whether a stale local copy is an acceptable fallback)."""
-    import gdown
-    for attempt in range(2):
-        try:
-            gdown.download(id=st.secrets["drive_file_id"], output=DB_PATH, quiet=True)
-            return True
-        except Exception as e:
-            last_error = e
-            time.sleep(2)
-    st.session_state["db_download_error"] = str(last_error)
+    """Pull the latest database, preferring the GitHub release asset and falling back to the
+    Google Drive link.
+
+    GitHub is first because Drive's anonymous-download limit is enforced per source IP and
+    Streamlit Cloud runs on shared egress, so the deployed app could sit throttled for days
+    while the identical link worked fine from a laptop — refreshes failed with
+    FileURLRetrievalError and the app was stuck on whatever copy it already had. GitHub
+    documents no bandwidth limit on release assets, needs no credentials to read a public one,
+    and uses only the standard library, so there's no third-party downloader to drift.
+
+    Drive is kept as a fallback so the app still works if a sync hasn't published to the release
+    yet. Returns True on success."""
+    errors = []
+    try:
+        urllib.request.urlretrieve(DB_RELEASE_URL, DB_PATH)
+        return True
+    except Exception as e:
+        errors.append(f"GitHub release: {e}")
+
+    if "drive_file_id" in st.secrets:
+        import gdown
+        for _attempt in range(2):
+            try:
+                gdown.download(id=st.secrets["drive_file_id"], output=DB_PATH, quiet=True)
+                return True
+            except Exception as e:
+                errors.append(f"Drive: {e}")
+                time.sleep(2)
+    st.session_state["db_download_error"] = " | ".join(errors)
     return False
 
 
@@ -131,13 +150,6 @@ def ensure_db():
     stale = not have_local_copy or (time.time() - os.path.getmtime(DB_PATH)) > DB_REFRESH_SECONDS
     if not stale:
         return
-    if "drive_file_id" not in st.secrets:
-        st.error(
-            "Missing `drive_file_id` in Streamlit secrets — set it to the Google Drive "
-            "file ID of blue_ballers.db (Share > Anyone with the link > copy the ID out "
-            "of the URL) in the app's Settings > Secrets."
-        )
-        st.stop()
     if download_db():
         return
     if have_local_copy:

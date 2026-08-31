@@ -83,6 +83,23 @@ NFLVERSE_SNAP_COUNTS_URL = "https://github.com/nflverse/nflverse-data/releases/d
 # Gemini itself. Key comes from Colab's own secrets store (key icon in the
 # left sidebar) -- add GEMINI_API_KEY there once and grant this notebook
 # access the first time it prompts. Never hardcode the key here.
+# Publish the finished database to a GitHub Release, which is what the deployed dashboard
+# downloads. Drive stays the working copy (Colab writes straight to it), but Drive's
+# anonymous-download limit is enforced per source IP and Streamlit Cloud shares its egress with
+# thousands of apps, so the deployed app could sit throttled for days while the same link worked
+# fine elsewhere. GitHub documents no bandwidth limit on release assets.
+# Needs a GitHub token with `repo` scope in Colab's secrets (key icon, left sidebar) named
+# GITHUB_TOKEN. Without one this step is skipped and the sync is otherwise unaffected.
+PUBLISH_TO_GITHUB = True
+GITHUB_REPO = "tommykoreen-commits/blue-ballers-analytics"
+GITHUB_RELEASE_TAG = "data"
+
+try:
+    from google.colab import userdata as _colab_userdata
+    GITHUB_TOKEN = _colab_userdata.get("GITHUB_TOKEN")
+except Exception:
+    GITHUB_TOKEN = None
+
 SYNC_LEAGUE_NEWS = True
 GEMINI_MODEL = "gemini-3.7-flash"
 GEMINI_PACING_SECONDS = 4  # stay well under the free tier's per-minute cap during a ~28-week backfill
@@ -1521,3 +1538,54 @@ try:
             print(" ", name)
 finally:
     session.close()
+
+
+# ---------------------------------------------------------------------------
+# Publish to GitHub Releases — the deployed dashboard reads the database from here.
+# Replaces the single asset on the fixed GITHUB_RELEASE_TAG release so the download URL
+# never changes. Wrapped defensively like every other external step: a failure here leaves
+# the synced database on Drive untouched.
+# ---------------------------------------------------------------------------
+def publish_db_to_github(token, repo, tag, db_path):
+    api = "https://api.github.com"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+
+    resp = requests.get(f"{api}/repos/{repo}/releases/tags/{tag}", headers=headers, timeout=30)
+    if resp.status_code == 404:
+        resp = requests.post(f"{api}/repos/{repo}/releases", headers=headers, timeout=30,
+                              json={"tag_name": tag, "name": "League database",
+                                    "body": "Latest synced Blue Ballers database."})
+    resp.raise_for_status()
+    release = resp.json()
+
+    name = os.path.basename(db_path)
+    for asset in release.get("assets", []):
+        if asset["name"] == name:
+            # A release can't hold two assets with the same name, so the old one goes first.
+            requests.delete(f"{api}/repos/{repo}/releases/assets/{asset['id']}",
+                             headers=headers, timeout=30).raise_for_status()
+
+    with open(db_path, "rb") as fh:
+        upload = requests.post(
+            f"https://uploads.github.com/repos/{repo}/releases/{release['id']}/assets",
+            params={"name": name}, data=fh, timeout=600,
+            headers={**headers, "Content-Type": "application/octet-stream"},
+        )
+    upload.raise_for_status()
+    return upload.json()["browser_download_url"]
+
+
+if PUBLISH_TO_GITHUB and GITHUB_TOKEN:
+    print("\nPublishing database to GitHub Releases...")
+    try:
+        url = publish_db_to_github(GITHUB_TOKEN, GITHUB_REPO, GITHUB_RELEASE_TAG, DB_PATH)
+        print(f"  published: {url}")
+        print("  the deployed dashboard will pick this up on its next refresh")
+    except Exception as e:
+        print(f"  WARNING: publish failed, skipping ({e}) — the database on Drive is fine, "
+              f"but the deployed app won't see this sync until a publish succeeds")
+elif PUBLISH_TO_GITHUB:
+    print("\nSkipping GitHub publish — no GITHUB_TOKEN in Colab secrets "
+          "(key icon in the left sidebar; needs a token with `repo` scope)")
+else:
+    print("\nSkipping GitHub publish (PUBLISH_TO_GITHUB=False)")
