@@ -83,7 +83,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-23-db-from-github-release"
+APP_BUILD = "2026-08-31-gm-ratings-by-magnitude"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -3992,10 +3992,25 @@ def get_completed_season_placements(league_id):
     return placements
 
 
+GM_SCORE_SPREAD = 16.7  # points per standard deviation, so ~1 in 3 managers lands outside 33-67
+
+
 def to_score_100(raw_series):
+    """0-100 rating from how far a manager sits from the league average, not from their rank.
+
+    Ranking looked like a score without being one. With eight managers a rank percentile can
+    only ever produce 12, 25, 38, 50, 62, 75, 88 or 100, so sixth place always read as "75" --
+    a number that looks like a solid grade while meaning below average. It also erased the
+    gaps: managers separated by a single percentage point of trade win-rate were shown 13
+    points apart, and a genuinely dominant manager looked no better than one who edged out the
+    field. Distance from the mean keeps 50 as average and lets the spread reflect reality."""
     if raw_series.empty or raw_series.nunique() <= 1:
         return pd.Series([50] * len(raw_series), index=raw_series.index)
-    return (raw_series.rank(pct=True) * 100).round().astype(int)
+    std = raw_series.std(ddof=0)
+    if not std or pd.isna(std):
+        return pd.Series([50] * len(raw_series), index=raw_series.index)
+    z = (raw_series - raw_series.mean()) / std
+    return (50 + GM_SCORE_SPREAD * z).clip(1, 99).round().astype(int)
 
 
 def build_gm_profiles(latest_league_id, latest_season_year, cache_key):
