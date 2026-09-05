@@ -83,7 +83,7 @@ DB_REFRESH_SECONDS = 14400  # how often the deployed app checks Drive for a fres
 
 # Bump this string with every edit — shown in the sidebar so it's obvious at a glance
 # whether the deployed app is actually running the latest code.
-APP_BUILD = "2026-08-31-gm-ratings-by-magnitude"
+APP_BUILD = "2026-09-03-trading-by-value"
 
 st.set_page_config(page_title="Blue Ballers Analytics", layout="wide")
 
@@ -4032,14 +4032,18 @@ def build_gm_profiles(latest_league_id, latest_season_year, cache_key):
             dev_total[owner] = dev_total.get(owner, 0) + 1
             dev_hits[owner] = dev_hits.get(owner, 0) + (1 if pick["delta"] > 0 else 0)
 
-    # Trading score is a win-rate (Winner=1/Even=0.5/Loser=0 per trade side), not a raw value-swing
-    # sum — a raw sum let one or two lopsided trades dominate a manager's whole career score
-    # regardless of how often they actually come out ahead. Shrunk toward the league-average rate
-    # so a manager with very few trades can't look like the league's best or worst trader off a
-    # tiny sample (same shrinkage idea as the power-rankings/simulator prior elsewhere in this file).
-    TRADE_ROLE_OUTCOME = {"Winner": 1.0, "Even": 0.5, "Loser": 0.0}
-    TRADE_SHRINKAGE = 3  # phantom trades at the league-average rate
-    trading_wins, trading_total = {}, {}
+    # Trading score is value gained per trade, not a win-rate. Counting each trade as one win or
+    # loss ignores how much was won or lost, and in this league that inverted the answer: the most
+    # active manager wins 53% of his 79 trades while being down 5,214 in value overall, and came
+    # out rated the third-best trader, while the manager up 9,563 rated second-worst for winning
+    # fewer of them. Trading well means coming out ahead on value, and a blowout should not weigh
+    # the same as a coin-flip swap.
+    #
+    # Per trade rather than in total, so a manager can't climb on volume alone, and shrunk by
+    # TRADE_SHRINKAGE toward the league average (which is 0 by construction -- every point one
+    # side gains, another loses) so a manager with three trades can't top the league on one steal.
+    TRADE_SHRINKAGE = 3  # phantom trades at the league-average margin of zero
+    trading_margin, trading_total = {}, {}
     for _, txn in get_all_trades(cache_key).iterrows():
         vt = get_historical_value_table(int(txn["season"]), cache_key)
         pp = get_season_power_pct(txn["league_id"], cache_key)
@@ -4047,14 +4051,10 @@ def build_gm_profiles(latest_league_id, latest_season_year, cache_key):
             owner = owner_lookup.get((txn["league_id"], side["roster_id"]))
             if owner:
                 trading_total[owner] = trading_total.get(owner, 0) + 1
-                trading_wins[owner] = trading_wins.get(owner, 0.0) + TRADE_ROLE_OUTCOME.get(side["role"], 0.5)
+                trading_margin[owner] = trading_margin.get(owner, 0.0) + side["win_now_impact"]
 
-    league_avg_trade_rate = (
-        sum(trading_wins.values()) / sum(trading_total.values()) if trading_total else 0.5
-    )
     trading = {
-        owner: (trading_wins[owner] + TRADE_SHRINKAGE * league_avg_trade_rate)
-        / (trading_total[owner] + TRADE_SHRINKAGE)
+        owner: trading_margin[owner] / (trading_total[owner] + TRADE_SHRINKAGE)
         for owner in trading_total
     }
 
